@@ -664,6 +664,29 @@ class Trovis557x:
         return SystemActivity.IDLE
 
     @property
+    def any_operating_mode_glt_active(self) -> bool | None:
+        """Return whether any present circuit is under GLT mode control.
+
+        ``False`` means every known operating-mode ownership bit is AUTARK. If
+        no circuit is known to be under GLT control but at least one present
+        ownership bit is unavailable, return ``None`` rather than reporting a
+        false all-AUTARK state.
+        """
+        states: list[bool | None] = []
+        for index in self.control_circuit_indices:
+            if index <= 3:
+                state = self._control_circuits[index - 1].mode_control_autonomous
+            else:
+                state = self.rk4.mode_control_autonomous
+            states.append(state)
+
+        if any(state is False for state in states):
+            return True
+        if states and all(state is True for state in states):
+            return False
+        return None
+
+    @property
     def system_overall_status(self) -> SystemOverallStatus | None:
         """Return the actuator-state bit mask for the configured hydronic system."""
         status = SystemOverallStatus.NONE
@@ -719,9 +742,56 @@ class Trovis557x:
         """Whether writing is enabled by the integration safety switch."""
         return self._writing_enabled
 
+    def _operating_mode_state_snapshot(self) -> dict[int, tuple[object, object]]:
+        """Return cached effective-mode and ownership state for present Rk slots."""
+        snapshot: dict[int, tuple[object, object]] = {}
+        for index in self.control_circuit_indices:
+            component = self._control_circuits[index - 1] if index <= 3 else self.rk4
+            snapshot[index] = (
+                component.active_mode,
+                component.mode_control_autonomous,
+            )
+        return snapshot
+
+    @staticmethod
+    def _operating_mode_ownership_label(value: object) -> str:
+        """Return one readable ownership label for diagnostic logging."""
+        if value is True:
+            return "AUTARK"
+        if value is False:
+            return "GLT"
+        return "unknown"
+
     async def async_update(self) -> None:
         """Refresh all active subsystems in pooled Modbus reads."""
+        before = self._operating_mode_state_snapshot()
         await self._group.async_update()
+        after = self._operating_mode_state_snapshot()
+
+        # Keep operating-mode transitions visible at INFO while the settling
+        # behaviour is being characterized. This also catches changes made at
+        # the controller or by another Modbus client, not only HA-originated
+        # writes. Once the behaviour is fully understood, these can move to
+        # DEBUG together with the targeted write logs in data_model.py.
+        for index, (active_after, ownership_after) in after.items():
+            active_before, ownership_before = before.get(index, (None, None))
+            if (active_before, ownership_before) == (None, None):
+                continue
+            if (active_before, ownership_before) == (
+                active_after,
+                ownership_after,
+            ):
+                continue
+
+            _LOGGER.info(
+                "Rk%d operating-mode state changed during full read: "
+                "active=%s -> %s; ownership=%s -> %s",
+                index,
+                getattr(active_before, "name", active_before),
+                getattr(active_after, "name", active_after),
+                self._operating_mode_ownership_label(ownership_before),
+                self._operating_mode_ownership_label(ownership_after),
+            )
 
     async def async_read_writing_enabled(self) -> bool:
         """Read the current write-enabled state directly from the controller."""

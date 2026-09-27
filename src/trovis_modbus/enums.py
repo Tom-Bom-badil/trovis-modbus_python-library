@@ -37,6 +37,14 @@ class HeatingCircuitControlMode(StrEnum):
     FIXED_SETPOINT = "fixed_setpoint"
 
 
+class PumpControlMode(StrEnum):
+    """Ownership/state selection for a remotely controllable pump output."""
+
+    AUTO = "auto"
+    ON = "on"
+    OFF = "off"
+
+
 class RemoteInputRole(StrEnum):
     """Resolved physical meaning of one FG1-FG3 input."""
 
@@ -158,16 +166,29 @@ class SystemOverallStatus(IntFlag):
 
 
 # Reusable option metadata for the enums above.
-# Rk1 through Rk4 share one writable operating-mode list.
-# PROGRAM remains readable through OperatingMode, but it is a timer-program
-# state rather than a normal mode selected through a writable field.
-OPERATING_MODE_OPTIONS = (
+#
+# ``OperatingMode`` represents the complete value domain reported by the
+# controller. Remote write support is intentionally narrower than that decode
+# domain: PROGRAM and MANUAL remain decodable states but are not normal Modbus
+# write targets. Heating and DHW option tuples stay separate so model-family
+# restrictions can be represented independently if later evidence requires it.
+HEATING_OPERATING_MODE_OPTIONS = (
     OptionMetadata("automatic", int(OperatingMode.AUTOMATIC), "Auto"),
     OptionMetadata("standby", int(OperatingMode.STANDBY), "Standby"),
-    OptionMetadata("manual", int(OperatingMode.MANUAL), "Hand"),
     OptionMetadata("day", int(OperatingMode.DAY), "Sonne"),
     OptionMetadata("night", int(OperatingMode.NIGHT), "Mond"),
 )
+
+DHW_OPERATING_MODE_OPTIONS = (
+    OptionMetadata("automatic", int(OperatingMode.AUTOMATIC), "Auto"),
+    OptionMetadata("standby", int(OperatingMode.STANDBY), "Standby"),
+    OptionMetadata("day", int(OperatingMode.DAY), "Sonne"),
+    OptionMetadata("night", int(OperatingMode.NIGHT), "Mond"),
+)
+
+# Backwards-compatible alias for callers that historically imported the single
+# common option list. Heating circuits remain the superset.
+OPERATING_MODE_OPTIONS = HEATING_OPERATING_MODE_OPTIONS
 
 
 WEEKDAY_OPTIONS = (

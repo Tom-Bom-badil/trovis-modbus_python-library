@@ -114,6 +114,8 @@ async def test_heating_circuit_reads(trovis: Trovis557x) -> None:
     await trovis.async_update()
     rk1 = trovis.rk1
     assert rk1.mode is OperatingMode.AUTOMATIC
+    assert rk1.active_mode is OperatingMode.AUTOMATIC
+    assert rk1.mode_control_autonomous is True
     assert rk1.valve_setpoint == 42
     assert rk1.flow_setpoint == pytest.approx(55.0)
     assert rk1.room_setpoint_active == pytest.approx(21.0)
@@ -143,6 +145,8 @@ async def test_domestic_hot_water(trovis: Trovis557x) -> None:
     rk4 = trovis.rk4
     assert rk4.setpoint_day == pytest.approx(50.0)
     assert rk4.setpoint_active == pytest.approx(50.0)
+    assert rk4.active_mode is OperatingMode.AUTOMATIC
+    assert rk4.mode_control_autonomous is True
     assert rk4.active_charging_setpoint == pytest.approx(67.0)
     assert rk4.disinfection_weekday is Weekday.WEDNESDAY
     assert rk4.disinfection_start == time(19, 0)
@@ -353,27 +357,60 @@ async def test_write_rejects_readonly(trovis: Trovis557x) -> None:
         await trovis.rk1.write("flow_setpoint", 50.0)
 
 
-async def test_mode_write_releases_override_coil(
-    trovis: Trovis557x, unit: MockModbusUnit
+async def test_mode_write_uses_command_register_and_effective_readback(
+    trovis: Trovis557x,
+    unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Setting the mode first releases the Ebene coil (0 = remote control)."""
-    await trovis.async_enable_writing()
-    await unit.write_coil(88, True)  # start "autonomous" (controller-controlled)
+    """Mode writes do not prewrite ownership and verify the active-mode HR."""
+    original_write_register = unit.write_register
+    original_write_coil = unit.write_coil
+    coil_writes: list[tuple[int, bool]] = []
+
+    async def emulate_controller_mode_write(address: int, value: int) -> None:
+        await original_write_register(address, value)
+        if address == 105:
+            unit.holding[73] = value
+            unit.coil[88] = False
+
+    async def track_coil_write(address: int, value: bool) -> None:
+        coil_writes.append((address, value))
+        await original_write_coil(address, value)
+
+    monkeypatch.setattr(unit, "write_register", emulate_controller_mode_write)
+    monkeypatch.setattr(unit, "write_coil", track_coil_write)
+
     await trovis.rk1.set_mode(OperatingMode.DAY)
 
-    # Override coil 88 (EBNBetrArtRk1) released to 0, then mode register written.
-    assert (await unit.read_coils(88, 1))[0] is False
+    assert coil_writes == []
     assert (await unit.read_holding_registers(105, 1))[0] == int(OperatingMode.DAY)
+    assert (await unit.read_holding_registers(73, 1))[0] == int(OperatingMode.DAY)
+    assert trovis.rk1.active_mode is OperatingMode.DAY
+    assert trovis.rk1.mode_control_autonomous is False
 
 
-async def test_circuit2_mode_uses_strided_override(
-    trovis: Trovis557x, unit: MockModbusUnit
+async def test_circuit2_mode_uses_its_own_command_and_active_registers(
+    trovis: Trovis557x,
+    unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Circuit 2's override coil follows the +2 stride (90, not 88)."""
-    await unit.write_coil(90, True)
+    """Circuit 2 uses HR40108/HR40075 and its own ownership bit."""
+    original_write_register = unit.write_register
+
+    async def emulate_controller_mode_write(address: int, value: int) -> None:
+        await original_write_register(address, value)
+        if address == 107:
+            unit.holding[74] = value
+            unit.coil[90] = False
+
+    monkeypatch.setattr(unit, "write_register", emulate_controller_mode_write)
+
     await trovis.rk2.set_mode(OperatingMode.NIGHT)
-    assert (await unit.read_coils(90, 1))[0] is False
+
     assert (await unit.read_holding_registers(107, 1))[0] == int(OperatingMode.NIGHT)
+    assert (await unit.read_holding_registers(74, 1))[0] == int(OperatingMode.NIGHT)
+    assert trovis.rk2.active_mode is OperatingMode.NIGHT
+    assert trovis.rk2.mode_control_autonomous is False
 
 
 async def test_write_access_enable_disable(

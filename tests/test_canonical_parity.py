@@ -39,6 +39,10 @@ HARDWARE_VERIFIED_SCALE: dict[int, float] = {
 # present in the older SmartHomeNG/5576-derived canonical reference file.
 KNOWN_NON_CANONICAL_REGISTERS = {
     register_address(40028),  # 5578-E AE3 / FG3 input
+    register_address(40074),  # Effective operating mode Rk1
+    register_address(40075),  # Effective operating mode Rk2
+    register_address(40076),  # Effective operating mode Rk3
+    register_address(40077),  # Effective operating mode Rk4 / DHW
     register_address(40042),  # 5578 analog input 0-10 V
     register_address(40043),  # Summer-operation daily outdoor-temperature average
     register_address(41100),  # PA1 P16 minimum buffer-tank charging setpoint

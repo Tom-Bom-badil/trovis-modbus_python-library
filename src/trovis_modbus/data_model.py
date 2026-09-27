@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
 from collections.abc import Callable, Iterable
 from enum import IntEnum
+from time import monotonic
 from typing import Any
 
 from modbus_connection import ModbusError, ModbusTimeoutError
@@ -25,7 +27,7 @@ from .configurations.address_ranges import (
     REGISTER_RANGES,
     is_span_readable,
 )
-from .enums import OperatingMode
+from .enums import OperatingMode, PumpControlMode
 from .exceptions import (
     TrovisValueValidationError,
     TrovisWriteAccessError,
@@ -64,6 +66,20 @@ LEVEL_AUTARK = True
 # explicit readback mismatch are retried; Modbus exception responses and
 # other protocol/connection errors keep their normal fail-fast semantics.
 WRITE_RETRIES = 2
+
+# Operating-mode commands are processed asynchronously inside TROVIS. A write
+# response can therefore arrive before HR40074..HR40077 expose the new effective
+# mode. Keep the command write and the state-settling phase separate: successful
+# writes are never repeated merely because active_mode has not caught up yet.
+OPERATING_MODE_VERIFY_INTERVAL = 0.25
+OPERATING_MODE_VERIFY_TIMEOUT = 5.0
+
+# Direct pump-output writes request GLT control. Releasing an output back to
+# controller/time-program operation is the opposite direction: its ownership
+# coil is written to AUTARK. Do not pre-write ownership=GLT; some TROVIS
+# controllers reject that direction with Modbus Illegal Function.
+PUMP_CONTROL_VERIFY_INTERVAL = 0.25
+PUMP_CONTROL_VERIFY_TIMEOUT = 5.0
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -822,11 +838,12 @@ async def async_ensure_writing_enabled(
 
 
 class TrovisComponent(Component):
-    """A Trovis sub-system: readable ranges + the Ebene write-unlock quirk.
+    """A Trovis sub-system with readable ranges and verified writes.
 
     Some writable values are ignored over Modbus unless their "Ebene" override
     coil is first released to 0 (= GLT / remote control). Subclasses list those
-    in :attr:`ebene_coils`.
+    ordinary datapoints in :attr:`ebene_coils`. Operating-mode ownership is a
+    separate protocol concept and is handled by the dedicated mode helpers.
     """
 
     register_ranges = REGISTER_RANGES
@@ -836,9 +853,11 @@ class TrovisComponent(Component):
     # Writable fields whose write must first change an Ebene override coil.
     ebene_coils: dict[str, tuple[int, int]] = {}
 
-    # Values that restore autonomous controller operation through the Ebene
-    # coil instead of being written to the corresponding holding register.
-    ebene_autark_values: dict[str, Any] = {"mode": OperatingMode.AUTOMATIC}
+    # Optional values that restore autonomous controller operation through an
+    # Ebene coil instead of writing the corresponding datapoint. Operating mode
+    # deliberately does not use this generic mechanism: external AUTOMATIC=1
+    # and AUTARK ownership are distinct controller states.
+    ebene_autark_values: dict[str, Any] = {}
 
     # Command/edge-trigger fields must opt out of automatic write retries.
     # A timed-out response for such a field has an inherently ambiguous
@@ -946,12 +965,11 @@ class TrovisComponent(Component):
         return metadata
 
     async def write(self, field: str, value: Any) -> None:
-        """Write a field, applying field-specific TROVIS preconditions.
+        """Write a field, applying generic field-specific TROVIS preconditions.
 
-        Most overridden fields first switch their Ebene coil to ``GLT`` and
-        then write the requested register value. Operating mode ``AUTOMATIC``
-        is the inverse operation: it restores ``AUTARK`` and deliberately
-        leaves the holding register untouched.
+        Ordinary overridden fields first switch their Ebene coil to ``GLT`` and
+        then write the requested value. Operating modes intentionally bypass
+        this mechanism and use :meth:`async_set_operating_mode` instead.
         """
         if (override := self.ebene_coils.get(field)) is not None:
             address, stride = override
@@ -968,11 +986,16 @@ class TrovisComponent(Component):
 
         await super().write(field, value)
 
-    def _resolved_write_field(self, field: str) -> Any:
-        """Return the resolved writable field used for targeted verification."""
+    def _resolved_field(self, field: str) -> Any:
+        """Return one resolved field from this configured component instance."""
         resolved = self.resolved_fields.get(field)
         if resolved is None:
             raise AttributeError(f"unknown field {field!r}")
+        return resolved
+
+    def _resolved_write_field(self, field: str) -> Any:
+        """Return the resolved writable field used for targeted verification."""
+        resolved = self._resolved_field(field)
         if not resolved.field.writable:
             raise AttributeError(f"{field} is read-only")
         return resolved
@@ -982,12 +1005,12 @@ class TrovisComponent(Component):
         """Decode one 16-bit register word as a signed integer."""
         return word - 0x10000 if word & 0x8000 else word
 
-    async def _read_field_for_verification(
+    async def _read_resolved_field(
         self,
         field: str,
+        resolved: Any,
     ) -> tuple[Any, int | None]:
-        """Read exactly one field span and update its local component cache."""
-        resolved = self._resolved_write_field(field)
+        """Read exactly one resolved field and update its component cache."""
         descriptor = resolved.field
 
         if isinstance(descriptor, RegisterField):
@@ -1011,6 +1034,23 @@ class TrovisComponent(Component):
         actual = descriptor.decode([bit])
         self._bits[field] = actual
         return actual, None
+
+    async def _read_datapoint_now(
+        self,
+        field: str,
+    ) -> tuple[Any, int | None]:
+        """Read one configured datapoint regardless of its writability."""
+        return await self._read_resolved_field(field, self._resolved_field(field))
+
+    async def _read_field_for_verification(
+        self,
+        field: str,
+    ) -> tuple[Any, int | None]:
+        """Read one writable field for generic targeted verification."""
+        return await self._read_resolved_field(
+            field,
+            self._resolved_write_field(field),
+        )
 
     async def _read_ebene_state(self, field: str) -> bool | None:
         """Read the override/Ebene coil for a field, if it has one."""
@@ -1059,9 +1099,10 @@ class TrovisComponent(Component):
                 return False
 
             if value == autark_value:
-                # In AUTARK the register is deliberately left untouched. Cache
-                # the logical requested mode after the override coil itself was
-                # verified; the next normal poll remains authoritative.
+                # In AUTARK-like generic overrides the register is deliberately
+                # left untouched. Cache the logical requested value after the
+                # override coil itself was verified; the next poll remains
+                # authoritative.
                 resolved = self._resolved_write_field(field)
                 if isinstance(resolved.field, RegisterField):
                     self._values[field] = value
@@ -1072,6 +1113,139 @@ class TrovisComponent(Component):
         actual, scale_exponent = await self._read_field_for_verification(field)
         expected = self._normalized_expected_value(field, value, scale_exponent)
         return actual == expected
+
+    def _pump_control_mode(
+        self,
+        output_field: str,
+        ownership_field: str,
+    ) -> PumpControlMode | None:
+        """Return AUTO/ON/OFF from one pump output and its ownership coil."""
+        ownership = getattr(self, ownership_field, None)
+        if ownership is LEVEL_AUTARK:
+            return PumpControlMode.AUTO
+        if ownership is not LEVEL_GLT:
+            return None
+
+        running = getattr(self, output_field, None)
+        if running is None:
+            return None
+        return PumpControlMode.ON if running else PumpControlMode.OFF
+
+    async def _wait_for_pump_control_state(
+        self,
+        output_field: str,
+        ownership_field: str,
+        requested: PumpControlMode,
+    ) -> tuple[bool, PumpControlMode | None, ModbusTimeoutError | None]:
+        """Poll one pump setting while output and ownership settle."""
+        started = monotonic()
+        actual: PumpControlMode | None = None
+        last_timeout: ModbusTimeoutError | None = None
+
+        while True:
+            try:
+                ownership, _ = await self._read_datapoint_now(ownership_field)
+                if ownership is LEVEL_AUTARK:
+                    actual = PumpControlMode.AUTO
+                elif ownership is LEVEL_GLT:
+                    running, _ = await self._read_datapoint_now(output_field)
+                    actual = PumpControlMode.ON if running else PumpControlMode.OFF
+                else:
+                    actual = None
+            except ModbusTimeoutError as err:
+                last_timeout = err
+                actual = None
+            except ModbusError:
+                raise
+
+            if actual is requested:
+                return True, actual, last_timeout
+
+            elapsed = monotonic() - started
+            remaining = PUMP_CONTROL_VERIFY_TIMEOUT - elapsed
+            if remaining <= 0:
+                return False, actual, last_timeout
+            await asyncio.sleep(min(PUMP_CONTROL_VERIFY_INTERVAL, remaining))
+
+    async def _async_set_pump_control_mode(
+        self,
+        output_field: str,
+        ownership_field: str,
+        mode: PumpControlMode | str,
+        *,
+        access_code: int = DEFAULT_WRITE_ACCESS_CODE,
+    ) -> None:
+        """Set AUTO/ON/OFF for one binary pump output and verify ownership.
+
+        AUTO writes only the pump ownership coil to AUTARK. ON and OFF write
+        only the actual output coil. A direct output write is expected to move
+        ownership to GLT itself; explicit ownership=GLT pre-writes are avoided.
+        """
+        try:
+            requested = PumpControlMode(mode)
+        except (TypeError, ValueError) as err:
+            raise TrovisValueValidationError(
+                f"Unsupported TROVIS pump control mode: {mode!r}"
+            ) from err
+
+        output = self._resolved_write_field(output_field)
+        ownership = self._resolved_field(ownership_field)
+        await async_ensure_writing_enabled(self._unit, access_code)
+
+        if requested is PumpControlMode.AUTO:
+            target_address = ownership.address
+            target_value = LEVEL_AUTARK
+        else:
+            target_address = output.address
+            target_value = requested is PumpControlMode.ON
+
+        last_timeout: ModbusTimeoutError | None = None
+        last_actual = self._pump_control_mode(output_field, ownership_field)
+
+        for attempt in range(WRITE_RETRIES + 1):
+            write_timed_out = False
+            try:
+                await self._unit.write_coil(target_address, target_value)
+            except ModbusTimeoutError as err:
+                last_timeout = err
+                write_timed_out = True
+            except ModbusError:
+                raise
+
+            (
+                verified,
+                last_actual,
+                verification_timeout,
+            ) = await self._wait_for_pump_control_state(
+                output_field,
+                ownership_field,
+                requested,
+            )
+            if verification_timeout is not None:
+                last_timeout = verification_timeout
+
+            if verified:
+                if requested is PumpControlMode.AUTO:
+                    try:
+                        await self._read_datapoint_now(output_field)
+                    except ModbusError:
+                        pass
+                return
+
+            # An acknowledged write is not repeated merely because the
+            # controller did not enter the requested ownership/state.
+            if not write_timed_out or attempt >= WRITE_RETRIES:
+                break
+
+        message = (
+            "Could not verify TROVIS pump control change "
+            f"{output_field!r} to {requested.value!r} within "
+            f"{PUMP_CONTROL_VERIFY_TIMEOUT:.1f}s "
+            f"(actual={getattr(last_actual, 'value', last_actual)})"
+        )
+        if last_timeout is not None:
+            raise TrovisWriteVerificationError(message) from last_timeout
+        raise TrovisWriteVerificationError(message)
 
     async def _write_datapoint_verified(self, field: str, value: Any) -> None:
         """Write one normal state value and verify it before any retry.
@@ -1143,6 +1317,453 @@ class TrovisComponent(Component):
             raise TrovisWriteVerificationError(message) from last_timeout
         raise TrovisWriteVerificationError(message)
 
+    def _validated_operating_mode(self, value: Any) -> OperatingMode:
+        """Return a remotely writable operating mode for this component."""
+        try:
+            mode = OperatingMode(value)
+        except (TypeError, ValueError) as err:
+            raise TrovisValueValidationError(
+                f"Unsupported TROVIS operating mode: {value!r}"
+            ) from err
+
+        metadata = self.require_metadata_for("mode")
+        if metadata.enum is None:
+            raise TrovisValueValidationError(
+                "TROVIS operating-mode metadata is unavailable"
+            )
+        allowed_values = {int(option.value) for option in metadata.enum.options}
+        if int(mode) not in allowed_values:
+            raise TrovisValueValidationError(
+                f"Operating mode {mode.name} is not remotely writable for this circuit"
+            )
+        return mode
+
+    def _operating_mode_log_context(self) -> tuple[str, str, str, str]:
+        """Return human-readable Rk/register labels for operating-mode logs."""
+        mode = self._resolved_field("mode")
+        active = self._resolved_field("active_mode")
+        ownership = self._resolved_field("mode_control_autonomous")
+
+        command_hr = mode.address + 40001
+        active_hr = active.address + 40001
+        ownership_cl = ownership.address + 1
+        label = {
+            40106: "Rk1",
+            40108: "Rk2",
+            40110: "Rk3",
+            40112: "Rk4",
+        }.get(command_hr, type(self).__name__)
+        return (
+            label,
+            f"HR{command_hr}",
+            f"HR{active_hr}",
+            f"CL{ownership_cl}",
+        )
+
+    @staticmethod
+    def _ownership_name(value: Any) -> str:
+        """Return a readable GLT/AUTARK label for logging."""
+        if value is LEVEL_AUTARK:
+            return "AUTARK"
+        if value is LEVEL_GLT:
+            return "GLT"
+        return "unknown"
+
+    async def _refresh_operating_mode_ownership(self) -> bool | None:
+        """Refresh and log the mode ownership cache without changing success."""
+        label, _, _, ownership_cl = self._operating_mode_log_context()
+        try:
+            state, _ = await self._read_datapoint_now("mode_control_autonomous")
+        except ModbusError as err:
+            _LOGGER.info(
+                "%s operating-mode ownership refresh failed at %s: %s",
+                label,
+                ownership_cl,
+                err,
+            )
+            return None
+
+        _LOGGER.info(
+            "%s operating-mode ownership: %s=%s",
+            label,
+            ownership_cl,
+            self._ownership_name(state),
+        )
+        return state
+
+    async def _wait_for_active_operating_mode(
+        self,
+        requested: OperatingMode,
+    ) -> tuple[bool, Any, ModbusTimeoutError | None]:
+        """Poll effective mode while the controller settles after one command write."""
+        label, _, active_hr, _ = self._operating_mode_log_context()
+        started = monotonic()
+        poll = 0
+        actual: Any = None
+        last_timeout: ModbusTimeoutError | None = None
+
+        while True:
+            poll += 1
+            try:
+                actual, _ = await self._read_datapoint_now("active_mode")
+            except ModbusTimeoutError as err:
+                last_timeout = err
+                actual = None
+                elapsed = monotonic() - started
+                _LOGGER.info(
+                    "%s operating-mode verification poll %d at %.2fs: "
+                    "%s read timed out while waiting for %s",
+                    label,
+                    poll,
+                    elapsed,
+                    active_hr,
+                    requested.name,
+                )
+            except ModbusError:
+                raise
+            else:
+                elapsed = monotonic() - started
+                if actual == requested:
+                    _LOGGER.info(
+                        "%s operating-mode verified: requested=%s actual=%s "
+                        "via %s after %.2fs (%d poll%s)",
+                        label,
+                        requested.name,
+                        requested.name,
+                        active_hr,
+                        elapsed,
+                        poll,
+                        "" if poll == 1 else "s",
+                    )
+                    return True, actual, last_timeout
+
+                _LOGGER.info(
+                    "%s operating-mode settling: requested=%s actual=%s "
+                    "via %s after %.2fs (poll %d)",
+                    label,
+                    requested.name,
+                    getattr(actual, "name", actual),
+                    active_hr,
+                    elapsed,
+                    poll,
+                )
+
+            elapsed = monotonic() - started
+            remaining = OPERATING_MODE_VERIFY_TIMEOUT - elapsed
+            if remaining <= 0:
+                return False, actual, last_timeout
+            await asyncio.sleep(min(OPERATING_MODE_VERIFY_INTERVAL, remaining))
+
+    async def _wait_for_operating_mode_ownership(
+        self,
+        expected: bool,
+    ) -> tuple[bool, Any, ModbusTimeoutError | None]:
+        """Poll the ownership coil while an AUTARK/GLT transition settles."""
+        label, _, _, ownership_cl = self._operating_mode_log_context()
+        started = monotonic()
+        poll = 0
+        state: Any = None
+        last_timeout: ModbusTimeoutError | None = None
+
+        while True:
+            poll += 1
+            try:
+                state, _ = await self._read_datapoint_now("mode_control_autonomous")
+            except ModbusTimeoutError as err:
+                last_timeout = err
+                state = None
+                elapsed = monotonic() - started
+                _LOGGER.info(
+                    "%s operating-mode ownership verification poll %d at %.2fs: "
+                    "%s read timed out while waiting for %s",
+                    label,
+                    poll,
+                    elapsed,
+                    ownership_cl,
+                    self._ownership_name(expected),
+                )
+            except ModbusError:
+                raise
+            else:
+                elapsed = monotonic() - started
+                if state is expected:
+                    _LOGGER.info(
+                        "%s operating-mode ownership verified: %s=%s after "
+                        "%.2fs (%d poll%s)",
+                        label,
+                        ownership_cl,
+                        self._ownership_name(state),
+                        elapsed,
+                        poll,
+                        "" if poll == 1 else "s",
+                    )
+                    return True, state, last_timeout
+
+                _LOGGER.info(
+                    "%s operating-mode ownership settling: requested=%s "
+                    "actual=%s via %s after %.2fs (poll %d)",
+                    label,
+                    self._ownership_name(expected),
+                    self._ownership_name(state),
+                    ownership_cl,
+                    elapsed,
+                    poll,
+                )
+
+            elapsed = monotonic() - started
+            remaining = OPERATING_MODE_VERIFY_TIMEOUT - elapsed
+            if remaining <= 0:
+                return False, state, last_timeout
+            await asyncio.sleep(min(OPERATING_MODE_VERIFY_INTERVAL, remaining))
+
+    async def async_set_operating_mode(
+        self,
+        mode: OperatingMode | int,
+        *,
+        access_code: int = DEFAULT_WRITE_ACCESS_CODE,
+    ) -> None:
+        """Set an external operating mode and verify the effective mode.
+
+        The controller's command register and effective-mode register are
+        intentionally different. A valid external write switches ownership to
+        GLT itself, so no ownership coil is written before the command. The
+        command register is also not used for verification because real TROVIS
+        controllers may normalize its readback.
+
+        A successful command write is sent exactly once. ``active_mode`` is
+        then polled while the controller settles. Only a lost write response
+        can cause a command retry, and even then the effective mode is checked
+        for the complete settling window before another write is sent.
+        """
+        requested = self._validated_operating_mode(mode)
+        label, command_hr, active_hr, ownership_cl = self._operating_mode_log_context()
+        active_before = getattr(self, "active_mode", None)
+        ownership_before = getattr(self, "mode_control_autonomous", None)
+
+        _LOGGER.info(
+            "%s operating-mode change requested: target=%s; active_before=%s; "
+            "ownership_before=%s; command=%s; verify=%s; ownership=%s",
+            label,
+            requested.name,
+            getattr(active_before, "name", active_before),
+            self._ownership_name(ownership_before),
+            command_hr,
+            active_hr,
+            ownership_cl,
+        )
+
+        await async_ensure_writing_enabled(self._unit, access_code)
+        _LOGGER.info("%s operating-mode write access confirmed", label)
+
+        last_timeout: ModbusTimeoutError | None = None
+        last_actual: Any = active_before
+
+        for attempt in range(WRITE_RETRIES + 1):
+            write_timed_out = False
+            write_started = monotonic()
+            try:
+                # Bypass TrovisComponent.write(): operating-mode ownership must
+                # not receive the generic Ebene=GLT prewrite.
+                await super().write("mode", requested)
+            except ModbusTimeoutError as err:
+                last_timeout = err
+                write_timed_out = True
+                _LOGGER.info(
+                    "%s operating-mode command %s=%s timed out on write "
+                    "attempt %d/%d after %.2fs; polling %s before any retry",
+                    label,
+                    command_hr,
+                    requested.name,
+                    attempt + 1,
+                    WRITE_RETRIES + 1,
+                    monotonic() - write_started,
+                    active_hr,
+                )
+            except ModbusError:
+                raise
+            else:
+                _LOGGER.info(
+                    "%s operating-mode command written: %s=%s on attempt %d/%d "
+                    "in %.2fs",
+                    label,
+                    command_hr,
+                    requested.name,
+                    attempt + 1,
+                    WRITE_RETRIES + 1,
+                    monotonic() - write_started,
+                )
+
+            (
+                verified,
+                last_actual,
+                verification_timeout,
+            ) = await self._wait_for_active_operating_mode(requested)
+            if verification_timeout is not None:
+                last_timeout = verification_timeout
+
+            if verified:
+                ownership = await self._refresh_operating_mode_ownership()
+                _LOGGER.info(
+                    "%s operating-mode change complete: active=%s; ownership=%s",
+                    label,
+                    requested.name,
+                    self._ownership_name(ownership),
+                )
+                return
+
+            if not write_timed_out:
+                _LOGGER.warning(
+                    "%s operating-mode command %s=%s was acknowledged, but %s "
+                    "remained %s after %.1fs; command will not be repeated",
+                    label,
+                    command_hr,
+                    requested.name,
+                    active_hr,
+                    getattr(last_actual, "name", last_actual),
+                    OPERATING_MODE_VERIFY_TIMEOUT,
+                )
+                break
+
+            if attempt < WRITE_RETRIES:
+                _LOGGER.info(
+                    "%s operating-mode write response was lost and target did "
+                    "not become effective within %.1fs; retrying command (%d/%d)",
+                    label,
+                    OPERATING_MODE_VERIFY_TIMEOUT,
+                    attempt + 2,
+                    WRITE_RETRIES + 1,
+                )
+
+        message = (
+            f"Could not verify {label} TROVIS operating-mode write through "
+            f"active_mode within {OPERATING_MODE_VERIFY_TIMEOUT:.1f}s "
+            f"(requested={requested.name}, "
+            f"actual={getattr(last_actual, 'name', last_actual)})"
+        )
+        if last_timeout is not None:
+            raise TrovisWriteVerificationError(message) from last_timeout
+        raise TrovisWriteVerificationError(message)
+
+    async def async_release_operating_mode_control(
+        self,
+        *,
+        access_code: int = DEFAULT_WRITE_ACCESS_CODE,
+    ) -> None:
+        """Release operating-mode ownership back to the TROVIS controller.
+
+        AUTARK is an ownership state, not ``OperatingMode.AUTOMATIC``. Only the
+        circuit's mode-ownership coil is written to 1 and verified. The command
+        register is deliberately left untouched.
+        """
+        label, command_hr, active_hr, ownership_cl = self._operating_mode_log_context()
+        active_before = getattr(self, "active_mode", None)
+        ownership_before = getattr(self, "mode_control_autonomous", None)
+        _LOGGER.info(
+            "%s operating-mode AUTARK release requested: active_before=%s; "
+            "ownership_before=%s; ownership=%s; command=%s untouched; "
+            "active=%s",
+            label,
+            getattr(active_before, "name", active_before),
+            self._ownership_name(ownership_before),
+            ownership_cl,
+            command_hr,
+            active_hr,
+        )
+
+        await async_ensure_writing_enabled(self._unit, access_code)
+        _LOGGER.info("%s operating-mode write access confirmed", label)
+        ownership = self._resolved_field("mode_control_autonomous")
+
+        last_timeout: ModbusTimeoutError | None = None
+        last_state: Any = ownership_before
+
+        for attempt in range(WRITE_RETRIES + 1):
+            write_timed_out = False
+            write_started = monotonic()
+            try:
+                await self._unit.write_coil(ownership.address, LEVEL_AUTARK)
+            except ModbusTimeoutError as err:
+                last_timeout = err
+                write_timed_out = True
+                _LOGGER.info(
+                    "%s operating-mode AUTARK write %s=1 timed out on attempt "
+                    "%d/%d after %.2fs; verifying ownership before any retry",
+                    label,
+                    ownership_cl,
+                    attempt + 1,
+                    WRITE_RETRIES + 1,
+                    monotonic() - write_started,
+                )
+            except ModbusError:
+                raise
+            else:
+                _LOGGER.info(
+                    "%s operating-mode AUTARK command written: %s=1 on attempt "
+                    "%d/%d in %.2fs",
+                    label,
+                    ownership_cl,
+                    attempt + 1,
+                    WRITE_RETRIES + 1,
+                    monotonic() - write_started,
+                )
+
+            (
+                verified,
+                last_state,
+                verification_timeout,
+            ) = await self._wait_for_operating_mode_ownership(LEVEL_AUTARK)
+            if verification_timeout is not None:
+                last_timeout = verification_timeout
+
+            if verified:
+                try:
+                    active, _ = await self._read_datapoint_now("active_mode")
+                except ModbusError as err:
+                    _LOGGER.info(
+                        "%s operating-mode AUTARK verified, but %s refresh failed: %s",
+                        label,
+                        active_hr,
+                        err,
+                    )
+                else:
+                    _LOGGER.info(
+                        "%s operating-mode AUTARK release complete: "
+                        "ownership=AUTARK; active=%s",
+                        label,
+                        getattr(active, "name", active),
+                    )
+                return
+
+            if not write_timed_out:
+                _LOGGER.warning(
+                    "%s operating-mode AUTARK command was acknowledged, but %s "
+                    "remained %s after %.1fs; command will not be repeated",
+                    label,
+                    ownership_cl,
+                    self._ownership_name(last_state),
+                    OPERATING_MODE_VERIFY_TIMEOUT,
+                )
+                break
+
+            if attempt < WRITE_RETRIES:
+                _LOGGER.info(
+                    "%s operating-mode AUTARK write response was lost and "
+                    "ownership did not settle within %.1fs; retrying (%d/%d)",
+                    label,
+                    OPERATING_MODE_VERIFY_TIMEOUT,
+                    attempt + 2,
+                    WRITE_RETRIES + 1,
+                )
+
+        message = (
+            f"Could not verify {label} TROVIS AUTARK operating-mode ownership "
+            f"within {OPERATING_MODE_VERIFY_TIMEOUT:.1f}s "
+            f"(actual={self._ownership_name(last_state)})"
+        )
+        if last_timeout is not None:
+            raise TrovisWriteVerificationError(message) from last_timeout
+        raise TrovisWriteVerificationError(message)
+
     async def async_write_datapoint(
         self,
         field: str,
@@ -1158,6 +1779,10 @@ class TrovisComponent(Component):
         keep their normal full-refresh path because no cache-safe verification
         was performed.
         """
+        if field == "mode":
+            await self.async_set_operating_mode(value, access_code=access_code)
+            return True
+
         await async_ensure_writing_enabled(self._unit, access_code)
 
         if field in self.non_retryable_write_fields:

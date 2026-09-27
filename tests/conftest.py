@@ -38,13 +38,20 @@ HOLDING: dict[int, int] = {
     28: 240,  # sensors.pulse_rate -> 240 Imp/h
     41: 735,  # sensors.analog_input_voltage -> 7.35 V / current view -> 147.0 mA
     42: 185,  # sensors.summer_outdoor_temperature_average -> 18.5 °C
+    73: 1,  # HR40074 / Rk1 active operating mode -> AUTOMATIC
+    74: 1,  # HR40075 / Rk2 active operating mode -> AUTOMATIC
+    75: 1,  # HR40076 / Rk3 active operating mode -> AUTOMATIC
+    76: 1,  # HR40077 / Rk4 active operating mode -> AUTOMATIC
     98: 900,  # max flow setpoint -> 90.0
     99: 1430,  # time -> 14:30
     100: 2106,  # date -> 21.06
     101: 2026,  # year
     102: 1,  # switch_top -> AUTOMATIC
-    105: 1,  # rk1 mode -> AUTOMATIC
+    105: 1,  # HR40106 / Rk1 external mode command -> AUTOMATIC
     106: 42,  # rk1 control signal -> 42 %
+    107: 1,  # HR40108 / Rk2 external mode command -> AUTOMATIC
+    109: 1,  # HR40110 / Rk3 external mode command -> AUTOMATIC
+    111: 1,  # HR40112 / Rk4 external mode command -> AUTOMATIC
     112: 1505,  # summer start -> 15.05
     113: 3009,  # summer end -> 30.09
     114: 2,  # summer_days_on
@@ -107,6 +114,15 @@ COILS: dict[int, bool] = {
     138: False,  # CL139 / FB10 / pulse input inactive
     3: True,  # CL4 / Sammel_Ebenenbit -> AUTARK by default
     56: True,  # rk1 pump
+    88: True,  # CL89 / Rk1 operating-mode ownership -> AUTARK
+    90: True,  # CL91 / Rk2 operating-mode ownership -> AUTARK
+    92: True,  # CL93 / Rk3 operating-mode ownership -> AUTARK
+    94: True,  # CL95 / Rk4 operating-mode ownership -> AUTARK
+    95: True,  # CL96 / Rk1 pump ownership -> AUTARK
+    96: True,  # CL97 / Rk2 pump ownership -> AUTARK
+    97: True,  # CL98 / Rk3 pump ownership -> AUTARK
+    98: True,  # CL99 / Rk4 SLP ownership -> AUTARK
+    99: True,  # CL100 / Rk4 ZP ownership -> AUTARK
     158: False,  # CL159 / GLT timeout inactive
     999: True,  # rk1 automatic
     1000: True,  # rk1 day active

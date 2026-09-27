@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import time
 
 from ..data_model import (
+    DEFAULT_WRITE_ACCESS_CODE,
     TrovisComponent,
     coil,
     enum,
@@ -14,9 +15,10 @@ from ..data_model import (
     time_value,
 )
 from ..enums import (
-    OPERATING_MODE_OPTIONS,
+    DHW_OPERATING_MODE_OPTIONS,
     WEEKDAY_OPTIONS,
     OperatingMode,
+    PumpControlMode,
     StorageStatus,
     Weekday,
 )
@@ -31,9 +33,9 @@ class DomesticHotWater(TrovisComponent):
     setpoint_day = temperature(
         41800,
         writable=True,
-        min_value=20,
+        min_value=5,
         max_value=90,
-        raw_min=200,
+        raw_min=50,
         raw_max=900,
         digits=1,
         maker_key="TW_Sollw",
@@ -130,9 +132,9 @@ class DomesticHotWater(TrovisComponent):
     setpoint_night = temperature(
         41807,
         writable=True,
-        min_value=20,
+        min_value=5,
         max_value=90,
-        raw_min=200,
+        raw_min=50,
         raw_max=900,
         digits=1,
         maker_key="TW_Haltewert",
@@ -165,14 +167,20 @@ class DomesticHotWater(TrovisComponent):
         description="Sonder-Trinkwassersollwert",
     )
 
+    active_mode = enum(
+        40077,
+        OperatingMode,
+        description="Effektive Betriebsart Trinkwasser",
+    )
+
     mode = enum(
         40112,
         OperatingMode,
         writable=True,
-        options=OPERATING_MODE_OPTIONS,
+        options=DHW_OPERATING_MODE_OPTIONS,
         maker_key="BetriebsArt_TW",
         maker_category="ALG-BTR",
-        description="Betriebsart Trinkwasser",
+        description="Externe Betriebsartvorgabe Trinkwasser",
     )
 
     storage_status = enum(
@@ -546,13 +554,53 @@ class DomesticHotWater(TrovisComponent):
     # automatically repeated when their response is lost.
     non_retryable_write_fields = frozenset({"forced_charging"})
 
-    # Override coils released before a write (no per-index stride here).
-    ebene_coils = {
-        "mode": (95, 0),
-        "storage_tank_charging_pump_running": (99, 0),
-        "circulation_pump_running": (100, 0),
-        "special_setpoint": (112, 0),
-    }
+    # Pump ownership is handled by dedicated AUTO/ON/OFF helpers. The special
+    # setpoint keeps the ordinary generic Ebene pre-write behavior.
+    ebene_coils = {"special_setpoint": (112, 0)}
+
+    @property
+    def storage_tank_charging_pump_control_mode(self) -> PumpControlMode | None:
+        """Return AUTO/ON/OFF for the storage-tank charging pump."""
+        return self._pump_control_mode(
+            "storage_tank_charging_pump_running",
+            "storage_tank_charging_pump_control_autonomous",
+        )
+
+    async def async_set_storage_tank_charging_pump_control_mode(
+        self,
+        mode: PumpControlMode | str,
+        *,
+        access_code: int = DEFAULT_WRITE_ACCESS_CODE,
+    ) -> None:
+        """Set the storage-tank charging pump to AUTO, ON, or OFF."""
+        await self._async_set_pump_control_mode(
+            "storage_tank_charging_pump_running",
+            "storage_tank_charging_pump_control_autonomous",
+            mode,
+            access_code=access_code,
+        )
+
+    @property
+    def circulation_pump_control_mode(self) -> PumpControlMode | None:
+        """Return AUTO/ON/OFF for the DHW circulation pump."""
+        return self._pump_control_mode(
+            "circulation_pump_running",
+            "circulation_pump_control_autonomous",
+        )
+
+    async def async_set_circulation_pump_control_mode(
+        self,
+        mode: PumpControlMode | str,
+        *,
+        access_code: int = DEFAULT_WRITE_ACCESS_CODE,
+    ) -> None:
+        """Set the DHW circulation pump to AUTO, ON, or OFF."""
+        await self._async_set_pump_control_mode(
+            "circulation_pump_running",
+            "circulation_pump_control_autonomous",
+            mode,
+            access_code=access_code,
+        )
 
     @property
     def day_temperature_range(self) -> TemperatureRange | None:
@@ -579,8 +627,12 @@ class DomesticHotWater(TrovisComponent):
         await self.async_write_datapoint("setpoint_day", celsius)
 
     async def set_mode(self, mode: OperatingMode) -> None:
-        """Set the operating mode."""
-        await self.async_write_datapoint("mode", mode)
+        """Set one external operating mode and verify the effective mode."""
+        await self.async_set_operating_mode(mode)
+
+    async def release_mode_control(self) -> None:
+        """Release operating-mode ownership back to the controller (AUTARK)."""
+        await self.async_release_operating_mode_control()
 
     async def set_disinfection_start(self, value: time) -> None:
         """Set the start of the thermal-disinfection window."""

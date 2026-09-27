@@ -12,9 +12,11 @@ from trovis_modbus import (
     VolumeUnit,
 )
 from trovis_modbus.enums import (
+    DHW_OPERATING_MODE_OPTIONS,
     ENERGY_UNIT_OPTIONS,
     FLOW_RATE_UNIT_OPTIONS,
     HEAT_METER_READ_MODE_OPTIONS,
+    HEATING_OPERATING_MODE_OPTIONS,
     OPERATING_MODE_OPTIONS,
     POWER_UNIT_OPTIONS,
     VOLUME_UNIT_OPTIONS,
@@ -30,23 +32,35 @@ def _option_keys(options: tuple[OptionMetadata, ...]) -> tuple[str, ...]:
     return tuple(option.key for option in options)
 
 
-def test_operating_mode_options_are_shared_and_complete() -> None:
-    """Every circuit gets one common selectable operating-mode subset."""
-    assert _option_keys(OPERATING_MODE_OPTIONS) == (
+def test_operating_mode_options_separate_decode_domain_from_remote_writes() -> None:
+    """Remote mode subsets exclude PROGRAM/MANUAL while Rk1-Rk4 include NIGHT."""
+    assert _option_keys(HEATING_OPERATING_MODE_OPTIONS) == (
         "automatic",
         "standby",
-        "manual",
         "day",
         "night",
     )
-    assert _option_values(OPERATING_MODE_OPTIONS) == (
+    assert _option_values(HEATING_OPERATING_MODE_OPTIONS) == (
         int(OperatingMode.AUTOMATIC),
         int(OperatingMode.STANDBY),
-        int(OperatingMode.MANUAL),
         int(OperatingMode.DAY),
         int(OperatingMode.NIGHT),
     )
+    assert _option_keys(DHW_OPERATING_MODE_OPTIONS) == (
+        "automatic",
+        "standby",
+        "day",
+        "night",
+    )
+    assert _option_values(DHW_OPERATING_MODE_OPTIONS) == (
+        int(OperatingMode.AUTOMATIC),
+        int(OperatingMode.STANDBY),
+        int(OperatingMode.DAY),
+        int(OperatingMode.NIGHT),
+    )
+    assert OPERATING_MODE_OPTIONS == HEATING_OPERATING_MODE_OPTIONS
     assert int(OperatingMode.PROGRAM) not in _option_values(OPERATING_MODE_OPTIONS)
+    assert int(OperatingMode.MANUAL) not in _option_values(OPERATING_MODE_OPTIONS)
 
 
 def test_heat_meter_read_mode_options_match_controller_values() -> None:

@@ -4,11 +4,20 @@ from __future__ import annotations
 
 from typing import Literal
 
-from ..data_model import TrovisComponent, coil, enum, gauge, integer, temperature
+from ..data_model import (
+    DEFAULT_WRITE_ACCESS_CODE,
+    TrovisComponent,
+    coil,
+    enum,
+    gauge,
+    integer,
+    temperature,
+)
 from ..enums import (
-    OPERATING_MODE_OPTIONS,
+    HEATING_OPERATING_MODE_OPTIONS,
     HeatingCircuitControlMode,
     OperatingMode,
+    PumpControlMode,
 )
 from ..heating_curve import HeatingCurveParameters, calculate_heating_curve
 
@@ -24,15 +33,21 @@ class HeatingCircuit(TrovisComponent):
     """
 
     ### registers
+    active_mode = enum(
+        40074,
+        OperatingMode,
+        stride=1,
+        description="Effektive Betriebsart Rk",
+    )
     mode = enum(
         40106,
         OperatingMode,
         stride=2,
         writable=True,
-        options=OPERATING_MODE_OPTIONS,
+        options=HEATING_OPERATING_MODE_OPTIONS,
         maker_key="BetriebsArt_Rk1",
         maker_category="ALG-BTR",
-        description="Betriebsart Rk",
+        description="Externe Betriebsartvorgabe Rk",
     )
     valve_setpoint = integer(
         40107,
@@ -701,8 +716,27 @@ class HeatingCircuit(TrovisComponent):
         description="Adaption Rk",
     )
 
-    # Override coils (mode 89+2n, pump 96+1n) released before a write.
-    ebene_coils = {"mode": (89, 2), "pump_running": (96, 1)}
+    # Pump ownership is handled by the dedicated AUTO/ON/OFF API below.
+    ebene_coils: dict[str, tuple[int, int]] = {}
+
+    @property
+    def pump_control_mode(self) -> PumpControlMode | None:
+        """Return AUTO/ON/OFF for this circuit's circulation pump."""
+        return self._pump_control_mode("pump_running", "pump_control_autonomous")
+
+    async def async_set_pump_control_mode(
+        self,
+        mode: PumpControlMode | str,
+        *,
+        access_code: int = DEFAULT_WRITE_ACCESS_CODE,
+    ) -> None:
+        """Set this circuit's circulation pump to AUTO, ON, or OFF."""
+        await self._async_set_pump_control_mode(
+            "pump_running",
+            "pump_control_autonomous",
+            mode,
+            access_code=access_code,
+        )
 
     def heating_curve_parameters(self) -> HeatingCurveParameters:
         """Return a detached snapshot of all heating-curve input values."""
@@ -773,8 +807,12 @@ class HeatingCircuit(TrovisComponent):
         )
 
     async def set_mode(self, mode: OperatingMode) -> None:
-        """Set the operating mode."""
-        await self.async_write_datapoint("mode", mode)
+        """Set one external operating mode and verify the effective mode."""
+        await self.async_set_operating_mode(mode)
+
+    async def release_mode_control(self) -> None:
+        """Release operating-mode ownership back to the controller (AUTARK)."""
+        await self.async_release_operating_mode_control()
 
     async def set_room_setpoint_day(self, celsius: float) -> None:
         """Set the day room setpoint (°C)."""
