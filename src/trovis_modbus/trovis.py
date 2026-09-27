@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
+from modbus_connection import ModbusError
 from modbus_connection.model import Component, ComponentGroup
 
 from .addresses import register_address
@@ -58,6 +60,7 @@ if TYPE_CHECKING:
     from modbus_connection import ModbusUnit
 
 
+_LOGGER = logging.getLogger(__name__)
 _TROVIS_MODBUS_TIMEOUT = 1
 _TROVIS_MODBUS_CONNECT_DELAY = 0
 
@@ -183,17 +186,25 @@ class Trovis557x:
 
         register_ranges, coil_ranges = ranges_for_model(model)
         model_definition = get_model_definition_for_reported_model(model)
-
         sensors = Sensors(unit)
         sensors.configure_readable_ranges(register_ranges, coil_ranges)
         sensors.configure_readable_fields(model_definition.sensor_keys)
-        await sensors.async_update()
 
-        detected_sensors = tuple(
-            sensor_key
-            for sensor_key in sensors.detected_sensor_names
-            if model_definition.supports_sensor(sensor_key)
-        )
+        try:
+            await sensors.async_update()
+        except ModbusError as err:
+            _LOGGER.warning(
+                "Optional TROVIS sensor discovery failed; "
+                "continuing setup without detected sensors: %s",
+                err,
+            )
+            detected_sensors = ()
+        else:
+            detected_sensors = tuple(
+                sensor_key
+                for sensor_key in sensors.detected_sensor_names
+                if model_definition.supports_sensor(sensor_key)
+            )
 
         return TrovisProbe(
             model=model,
