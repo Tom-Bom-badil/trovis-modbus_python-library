@@ -153,6 +153,8 @@ def _print(device: Trovis557x) -> None:
             continue
         if attr == "solar" and not device.has_solar:
             continue
+        if attr.startswith("wmz") and getattr(device, attr) not in (device.heat_meters):
+            continue
         print()
         print_component(getattr(device, attr), title=label)
     _print_sensor_variants(device)

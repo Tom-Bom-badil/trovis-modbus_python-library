@@ -1,5 +1,11 @@
 """Static TROVIS controller and hydronic configuration definitions."""
 
+from .heat_meters import (
+    HEAT_METER_CONFIGURATIONS,
+    HEAT_METER_SLOTS,
+    HeatMeterConfiguration,
+    get_heat_meter_configuration,
+)
 from .hydronic_systems import (
     BUFFER_TANK_CHARGING_SYSTEM_CODES_BY_MODEL,
     CONTROL_PARAMETER_RK4_SYSTEM_CODES_BY_MODEL,
@@ -42,6 +48,8 @@ __all__ = [
     "COMMON_INDIVIDUAL_SENSOR_VARIANTS",
     "COMMON_SENSOR_KEYS",
     "FUNCTIONAL_SENSOR_ROLE_KEYS",
+    "HEAT_METER_CONFIGURATIONS",
+    "HEAT_METER_SLOTS",
     "HYDRONIC_CONFIGURATIONS",
     "INTERMEDIATE_HEATING_SYSTEM_CODES_BY_MODEL",
     "MODEL_DEFINITIONS",
@@ -61,9 +69,11 @@ __all__ = [
     "ConfigurationDefinition",
     "ConfigurationTopology",
     "ControllerModel",
+    "HeatMeterConfiguration",
     "ModelDefinition",
     "SensorVariant",
     "get_configuration_definition",
+    "get_heat_meter_configuration",
     "get_model_definition",
     "get_model_definition_for_reported_model",
     "model_candidates_for_reported_model",
