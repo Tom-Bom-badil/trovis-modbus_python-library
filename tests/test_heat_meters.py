@@ -86,9 +86,9 @@ def test_invalid_index(unit: MockModbusUnit, index: object) -> None:
         HeatMeter(unit, index=index)
 
 
-@pytest.mark.parametrize("model", [5573, 55731, 5575, 5576, 5578, 55781, 5579])
-async def test_device_polls_all_meter_slots(unit: MockModbusUnit, model: int) -> None:
-    device = Trovis557x(unit, model=model)
+async def test_device_polls_configured_meter_slots(unit: MockModbusUnit) -> None:
+    device = Trovis557x(unit, model=5578)
+    assert device.heat_meter_indices == (1, 2, 3)
     assert device.heat_meters == (device.wmz1, device.wmz2, device.wmz3)
     for index, meter in enumerate(device.heat_meters, start=1):
         assert meter in device.components
@@ -116,6 +116,59 @@ async def test_device_polls_all_meter_slots(unit: MockModbusUnit, model: int) ->
             assert len(events) == 1
             assert events[0].address <= base + offset
             assert events[0].address + events[0].count >= base + offset + 4
+
+
+def _heat_meter_reads(unit: MockModbusUnit) -> list[object]:
+    return [
+        event
+        for event in unit.read_events
+        if event.register_type == "holding"
+        and event.address + event.count > register_address(46500)
+        and event.address < register_address(47523)
+    ]
+
+
+@pytest.mark.parametrize("model", [5573, 55731, 5575, 5576, 55781, 5579])
+async def test_models_without_configured_meters_skip_polling(
+    unit: MockModbusUnit, model: int
+) -> None:
+    device = Trovis557x(unit, model=model)
+    assert device.heat_meter_indices == ()
+    assert device.heat_meters == ()
+    assert not any(isinstance(c, HeatMeter) for c in device.components)
+    await device.async_update()
+    assert not _heat_meter_reads(unit)
+    assert device.wmz1.flow_rate is None
+
+
+@pytest.mark.parametrize(
+    ("model", "hint", "expected"),
+    [
+        (5578, [], ()),
+        (5578, [2], (2,)),
+        (5579, [3, 1, 1], (1, 3)),
+        (5573, (1, 2, 3), (1, 2, 3)),
+    ],
+)
+async def test_heat_meter_hint_overrides_model(
+    unit: MockModbusUnit, model: int, hint: list[int], expected: tuple[int, ...]
+) -> None:
+    device = Trovis557x(unit, model=model, heat_meter_indices=hint)
+    assert device.heat_meter_indices == expected
+    all_meters = (device.wmz1, device.wmz2, device.wmz3)
+    assert device.heat_meters == tuple(all_meters[i - 1] for i in expected)
+    await device.async_update()
+    polled = {
+        (event.address - register_address(46500)) // 500 + 1
+        for event in _heat_meter_reads(unit)
+    }
+    assert polled == set(expected)
+
+
+@pytest.mark.parametrize("hint", [[0], [4], [True], ["1"]])
+def test_invalid_heat_meter_hint(unit: MockModbusUnit, hint: list[object]) -> None:
+    with pytest.raises((ValueError, TypeError)):
+        Trovis557x(unit, heat_meter_indices=hint)  # type: ignore[arg-type]
 
 
 async def test_planner_boundary_keeps_composites_intact(unit: MockModbusUnit) -> None:

@@ -15,6 +15,10 @@ from .configurations.address_ranges import (
     control_circuit_count,
     ranges_for_model,
 )
+from .configurations.heat_meters import (
+    HeatMeterConfiguration,
+    get_heat_meter_configuration,
+)
 from .configurations.hydronic_systems import (
     ConfigurationDefinition,
     ConfigurationTopology,
@@ -101,12 +105,22 @@ class Trovis557x:
         detected_sensors: Iterable[str] = (),
         excluded_registers: Iterable[int] = (),
         excluded_coils: Iterable[int] = (),
+        heat_meter_indices: Iterable[int] | None = None,
     ) -> None:
         if unit is not None:
             _configure_modbus_unit(unit)
         self._unit = unit
         self.model = model
         self.model_definition = get_model_definition_for_reported_model(model)
+        # An explicit hint overrides the model's verified heat-meter slots.
+        heat_meter_configuration = get_heat_meter_configuration(
+            self.model_definition.model
+        )
+        if heat_meter_indices is not None:
+            heat_meter_configuration = heat_meter_configuration.with_heat_meter_indices(
+                heat_meter_indices
+            )
+        self.heat_meter_configuration: HeatMeterConfiguration = heat_meter_configuration
         self.excluded_registers = normalize_excluded_addresses(excluded_registers)
         self.excluded_coils = normalize_excluded_addresses(excluded_coils)
         # Probe results may contain several descriptor views of the same raw
@@ -151,9 +165,7 @@ class Trovis557x:
             self.rk4,
             self.buffer_tank,
             self.solar,
-            self.wmz1,
-            self.wmz2,
-            self.wmz3,
+            *self.heat_meters,
         )
         register_ranges, coil_ranges = ranges_for_model(model)
         register_ranges = ranges_excluding_addresses(
@@ -224,9 +236,15 @@ class Trovis557x:
         return self._control_circuits
 
     @property
+    def heat_meter_indices(self) -> tuple[int, ...]:
+        """Return the WMZ slots exposed and polled for this controller."""
+        return self.heat_meter_configuration.heat_meter_indices
+
+    @property
     def heat_meters(self) -> tuple[HeatMeter, ...]:
-        """Return the three indexed M-Bus meter slots."""
-        return (self.wmz1, self.wmz2, self.wmz3)
+        """Return the exposed M-Bus meter slots."""
+        all_meters = (self.wmz1, self.wmz2, self.wmz3)
+        return tuple(all_meters[index - 1] for index in self.heat_meter_indices)
 
     @property
     def configuration_definition(self) -> ConfigurationDefinition | None:
