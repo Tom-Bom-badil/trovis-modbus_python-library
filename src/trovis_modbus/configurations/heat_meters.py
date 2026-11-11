@@ -20,7 +20,11 @@ class HeatMeterConfiguration:
 
     def __post_init__(self) -> None:
         for index in self.heat_meter_indices:
-            if isinstance(index, bool) or index not in HEAT_METER_SLOTS:
+            if (
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or index not in HEAT_METER_SLOTS
+            ):
                 raise ValueError("heat meter index must be in range 1..3")
         if len(set(self.heat_meter_indices)) != len(self.heat_meter_indices):
             raise ValueError(
@@ -34,15 +38,25 @@ class HeatMeterConfiguration:
     def with_heat_meter_indices(
         self, heat_meter_indices: Iterable[int]
     ) -> HeatMeterConfiguration:
-        """Return a copy overriding the exposed slots, e.g. from a user hint."""
+        """Select active slots from this model's supported heat-meter slots."""
+        selected = tuple(heat_meter_indices)
+        if any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index not in HEAT_METER_SLOTS
+            for index in selected
+        ):
+            raise ValueError("heat meter index must be in range 1..3")
+        if not set(selected).issubset(self.heat_meter_indices):
+            raise ValueError(f"heat meter slot not supported by {self.model.value}")
         return HeatMeterConfiguration(
             model=self.model,
-            heat_meter_indices=tuple(sorted(set(heat_meter_indices))),
+            heat_meter_indices=tuple(sorted(set(selected))),
         )
 
 
-# Only models with verified M-Bus heat-meter support are listed. All other
-# models expose no heat meters unless overridden by an explicit hint.
+# Known model support; this is NOT the default polling configuration.
+# Only explicitly enabled slots will be polled. Other models expose no slots.
 HEAT_METER_CONFIGURATIONS = MappingProxyType(
     {
         configuration.model: configuration

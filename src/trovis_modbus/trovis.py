@@ -112,14 +112,13 @@ class Trovis557x:
         self._unit = unit
         self.model = model
         self.model_definition = get_model_definition_for_reported_model(model)
-        # An explicit hint overrides the model's verified heat-meter slots.
+        # The model declares which WMZ slots exist; callers explicitly enable
+        # the subset to poll. By default, no heat meters are polled.
         heat_meter_configuration = get_heat_meter_configuration(
             self.model_definition.model
+        ).with_heat_meter_indices(
+            () if heat_meter_indices is None else heat_meter_indices
         )
-        if heat_meter_indices is not None:
-            heat_meter_configuration = heat_meter_configuration.with_heat_meter_indices(
-                heat_meter_indices
-            )
         self.heat_meter_configuration: HeatMeterConfiguration = heat_meter_configuration
         self.excluded_registers = normalize_excluded_addresses(excluded_registers)
         self.excluded_coils = normalize_excluded_addresses(excluded_coils)
@@ -178,6 +177,11 @@ class Trovis557x:
         )
         for component in all_components:
             component.configure_readable_ranges(register_ranges, coil_ranges)
+        # Inactive WMZ objects remain addressable as attributes but have no
+        # readable fields and are not part of ComponentGroup.
+        for meter in (self.wmz1, self.wmz2, self.wmz3):
+            if meter not in self.heat_meters:
+                meter.configure_readable_ranges((), ())
 
         # Ranges describe address availability. ModelDefinition additionally
         # limits logical sensor views that may share one readable register.

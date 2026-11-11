@@ -87,7 +87,7 @@ def test_invalid_index(unit: MockModbusUnit, index: object) -> None:
 
 
 async def test_device_polls_configured_meter_slots(unit: MockModbusUnit) -> None:
-    device = Trovis557x(unit, model=5578)
+    device = Trovis557x(unit, model=5578, heat_meter_indices=(1, 2, 3))
     assert device.heat_meter_indices == (1, 2, 3)
     assert device.heat_meters == (device.wmz1, device.wmz2, device.wmz3)
     for index, meter in enumerate(device.heat_meters, start=1):
@@ -128,7 +128,7 @@ def _heat_meter_reads(unit: MockModbusUnit) -> list[object]:
     ]
 
 
-@pytest.mark.parametrize("model", [5573, 55731, 5575, 5576, 55781, 5579])
+@pytest.mark.parametrize("model", [5573, 55731, 5575, 5576, 5578, 55781, 5579])
 async def test_models_without_configured_meters_skip_polling(
     unit: MockModbusUnit, model: int
 ) -> None:
@@ -139,6 +139,7 @@ async def test_models_without_configured_meters_skip_polling(
     await device.async_update()
     assert not _heat_meter_reads(unit)
     assert device.wmz1.flow_rate is None
+    assert not device.wmz1.readable_field_names
 
 
 @pytest.mark.parametrize(
@@ -146,8 +147,8 @@ async def test_models_without_configured_meters_skip_polling(
     [
         (5578, [], ()),
         (5578, [2], (2,)),
-        (5579, [3, 1, 1], (1, 3)),
-        (5573, (1, 2, 3), (1, 2, 3)),
+        (5578, [3, 1, 1], (1, 3)),
+        (5578, (1, 2, 3), (1, 2, 3)),
     ],
 )
 async def test_heat_meter_hint_overrides_model(
@@ -165,10 +166,18 @@ async def test_heat_meter_hint_overrides_model(
     assert polled == set(expected)
 
 
-@pytest.mark.parametrize("hint", [[0], [4], [True], ["1"]])
+@pytest.mark.parametrize("hint", [[0], [4], [True], ["1"], [1.0]])
 def test_invalid_heat_meter_hint(unit: MockModbusUnit, hint: list[object]) -> None:
     with pytest.raises((ValueError, TypeError)):
         Trovis557x(unit, heat_meter_indices=hint)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("model", [5573, 55731, 5575, 5576, 55781, 5579])
+def test_unsupported_model_rejects_heat_meter(
+    unit: MockModbusUnit, model: int
+) -> None:
+    with pytest.raises(ValueError, match="not supported"):
+        Trovis557x(unit, model=model, heat_meter_indices=(1,))
 
 
 async def test_planner_boundary_keeps_composites_intact(unit: MockModbusUnit) -> None:
@@ -194,7 +203,9 @@ async def test_exclusion_removes_entire_measurement(
     unit: MockModbusUnit, offset: int
 ) -> None:
     excluded = register_address(46500 + offset)
-    device = Trovis557x(unit, excluded_registers=[excluded])
+    device = Trovis557x(
+        unit, model=5578, heat_meter_indices=(1,), excluded_registers=[excluded]
+    )
     assert not device.wmz1.is_field_readable("flow_rate")
     assert device.wmz1.is_field_readable("volume")
     await device.async_update()

@@ -83,23 +83,24 @@ The exact datapoints exposed for a controller therefore reflect the capabilities
 
 The read-only `HeatMeter` component covers HR46500 through HR46522 for meter 1.
 Indices 2 and 3 add 500 and 1000 to those references. Normal device updates
-only poll the slots exposed for the detected model (see
-`trovis_modbus.configurations.HEAT_METER_CONFIGURATIONS`). Currently only the
-TROVIS 5578 is known to expose WMZ1-WMZ3; all other models expose none. Pass
-`heat_meter_indices` to override the per-model slots:
+only poll slots explicitly enabled with `heat_meter_indices`. The default is
+no heat-meter polling. Currently only the TROVIS 5578 is known to expose
+WMZ1-WMZ3 (see `trovis_modbus.configurations.HEAT_METER_CONFIGURATIONS`);
+other models reject heat-meter activation:
 
 ```python
 from trovis_modbus import HeatMeter, Trovis557x
 
-device = Trovis557x(unit)  # TROVIS 5578
+device = Trovis557x(unit, model=5578, heat_meter_indices=(1,))
 await device.async_update()
 flow_rate = device.wmz1.flow_rate  # m³/h
 energy = device.wmz1.energy  # kWh
 source_energy_unit = device.wmz1.energy_unit
-meters = device.heat_meters  # (wmz1, wmz2, wmz3)
-
-device = Trovis557x(unit, model=5579, heat_meter_indices=(1,))
 meters = device.heat_meters  # (wmz1,)
+
+# Omitting heat_meter_indices keeps WMZ polling disabled on every model.
+device = Trovis557x(unit, model=5578)
+meters = device.heat_meters  # ()
 
 meter = HeatMeter(unit, index=2)
 await meter.async_update()
@@ -121,7 +122,7 @@ operating-time unit, so none is assumed. Status bits are not interpreted.
 Values are `None` before updating or when their fields are excluded or unavailable.
 Invalid composite parts, unknown measurement unit selectors and invalid dates or
 times also decode to `None`. Excluding any measurement word, including its unit,
-disables the entire composite field. Exposed slots are polled regardless of
+disables the entire composite field. Enabled slots are polled regardless of
 whether a physical meter is connected; slot readability is not presence detection.
 M-Bus configuration, read triggers and registers after HR46522 are not yet modeled.
 
