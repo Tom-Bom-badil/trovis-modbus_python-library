@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, time
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
+
+from modbus_connection import ModbusError, ModbusExceptionError
+
+from .addresses import register_address
 
 # Outdoor-temperature x-axis shared by every heating characteristic.
 OUTDOOR_TEMPERATURES: list[int] = list(range(-20, 21))
@@ -122,3 +127,87 @@ def heating_curve(
             round(max(minimum_flow_temperature, min(maximum_flow_temperature, flow)), 2)
         )
     return curve
+
+
+# --- Minimal device identity ----------------------------------------------
+
+
+@dataclass(frozen=True)
+class TrovisIdentity:
+    """Raw TROVIS model and integer hundredths firmware version."""
+
+    model: int
+    firmware: int
+
+
+async def async_read_identity(unit: object) -> TrovisIdentity:
+    """Read HR40001/HR40003 independently, before optional sensor discovery."""
+    model_values = await unit.read_holding_registers(register_address(40001), 1)
+    firmware_values = await unit.read_holding_registers(register_address(40003), 1)
+    if len(model_values) != 1 or len(firmware_values) != 1:
+        raise ValueError("Incomplete TROVIS model/firmware identity response")
+    model = int(model_values[0])
+    firmware = int(firmware_values[0])
+    if model <= 0 or firmware <= 0:
+        raise ValueError("Invalid TROVIS model or firmware identity")
+    return TrovisIdentity(model=model, firmware=firmware)
+
+
+# --- Conservative Illegal Data Address diagnosis (FC01 / FC03) ------------
+
+
+class RefusedReadBlock(Protocol):
+    """The structural block attached by modbus-connection to a failed read."""
+
+    space: str
+    address: int
+    count: int
+
+
+_ILLEGAL_DATA_ADDRESS = 0x02
+
+MAX_DIAGNOSTIC_BLOCK_SIZE = 50
+
+
+def illegal_address_block(error: ModbusError) -> RefusedReadBlock | None:
+    """Return a valid refused read block for a genuine 0x02 response."""
+    if not isinstance(error, ModbusExceptionError):
+        return None
+    if error.exception_code != _ILLEGAL_DATA_ADDRESS:
+        return None
+    block = getattr(error, "block", None)
+    if block is None or block.space not in {"holding", "coil"}:
+        return None
+    if not 1 <= block.count <= MAX_DIAGNOSTIC_BLOCK_SIZE:
+        return None
+    if not 0 <= block.address <= 0xFFFF - block.count + 1:
+        return None
+    return block
+
+
+async def async_confirm_illegal_addresses(
+    unit: object, block: RefusedReadBlock
+) -> frozenset[int]:
+    """Confirm each illegal PDU address in a rejected block separately.
+
+    Propagate non-0x02 failures. No removal is justified when all single reads
+    succeed, which can happen if a combined read crossed a firmware boundary.
+    """
+    if block.space not in {"holding", "coil"}:
+        raise ValueError("Only coil and holding-register reads may be diagnosed")
+    if not 1 <= block.count <= MAX_DIAGNOSTIC_BLOCK_SIZE:
+        raise ValueError("Diagnostic block is outside the safety limit")
+    if not 0 <= block.address <= 0xFFFF - block.count + 1:
+        raise ValueError("Diagnostic block exceeds Modbus address range")
+    method = (
+        unit.read_holding_registers if block.space == "holding" else unit.read_coils
+    )
+    confirmed: set[int] = set()
+    for address in range(block.address, block.address + block.count):
+        try:
+            await method(address, 1)
+        except ModbusExceptionError as error:
+            if error.exception_code != _ILLEGAL_DATA_ADDRESS:
+                raise
+            confirmed.add(address)
+    return frozenset(confirmed)

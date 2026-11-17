@@ -10,9 +10,10 @@ from typing import TYPE_CHECKING
 from modbus_connection import ModbusError
 from modbus_connection.model import Component, ComponentGroup
 
-from .addresses import register_address
+from .addresses import normalize_excluded_addresses, ranges_excluding_addresses
 from .configurations.address_ranges import (
     control_circuit_count,
+    is_span_readable,
     ranges_for_model,
 )
 from .configurations.heat_meters import (
@@ -33,6 +34,7 @@ from .configurations.settings import Functions, Parameters
 from .configurations.trovis_models import get_model_definition_for_reported_model
 from .data_model import (
     DEFAULT_WRITE_ACCESS_CODE,
+    apply_overrides,
     async_disable_writing,
     async_enable_writing,
     async_read_writing_enabled,
@@ -46,10 +48,6 @@ from .enums import (
     SystemOverallStatus,
 )
 from .metadata import NumberMetadata
-from .read_exclusions import (
-    normalize_excluded_addresses,
-    ranges_excluding_addresses,
-)
 from .subsystems import (
     BufferTankCircuit,
     Clock,
@@ -60,6 +58,7 @@ from .subsystems import (
     Sensors,
     SolarCircuit,
 )
+from .utils import TrovisIdentity, async_read_identity
 
 if TYPE_CHECKING:
     from modbus_connection import ModbusUnit
@@ -81,12 +80,43 @@ def _configure_modbus_unit(unit: ModbusUnit) -> None:
         require_connect_delay(_TROVIS_MODBUS_CONNECT_DELAY)
 
 
+def _union_readable_ranges(
+    original: tuple[tuple[int, int], ...],
+    additional: Iterable[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    """Add approved spans WITHOUT joining the model's intentional boundaries.
+
+    A model can declare adjacent but distinct address blocks because crossing
+    their boundary in one pooled read is unsafe.  Only add as-yet-uncovered
+    pieces of explicit overrides; retain all original range boundaries.
+    """
+    result = list(original)
+    for low, high in additional:
+        missing = [(low, high)]
+        for existing_low, existing_high in result:
+            next_missing: list[tuple[int, int]] = []
+            for start, stop in missing:
+                if stop < existing_low or existing_high < start:
+                    next_missing.append((start, stop))
+                else:
+                    if start < existing_low:
+                        next_missing.append((start, existing_low - 1))
+                    if stop > existing_high:
+                        next_missing.append((existing_high + 1, stop))
+            missing = next_missing
+            if not missing:
+                break
+        result.extend(missing)
+    return tuple(sorted(result))
+
+
 @dataclass(frozen=True)
 class TrovisProbe:
     """Result of the safe setup probe."""
 
     model: int
     detected_sensors: tuple[str, ...]
+    firmware: int
 
     @property
     def model_name(self) -> str:
@@ -106,11 +136,15 @@ class Trovis557x:
         excluded_registers: Iterable[int] = (),
         excluded_coils: Iterable[int] = (),
         heat_meter_indices: Iterable[int] | None = None,
+        firmware_reference: int | None = None,
     ) -> None:
         if unit is not None:
             _configure_modbus_unit(unit)
         self._unit = unit
         self.model = model
+        self.firmware_reference = firmware_reference
+        self.added_override_fields: dict[str, frozenset[str]] = {}
+        self.override_address_fields: dict[str, frozenset[str]] = {}
         self.model_definition = get_model_definition_for_reported_model(model)
         # The model declares which WMZ slots exist; callers explicitly enable
         # the subset to poll. By default, no heat meters are polled.
@@ -151,32 +185,97 @@ class Trovis557x:
         self.wmz3 = HeatMeter(unit, index=3)
         self._writing_enabled = False
 
-        all_components = (
-            self.info,
-            self.controller,
-            self.clock,
-            self.functions,
-            self.parameters,
-            self.sensors,
-            self.rk1,
-            self.rk2,
-            self.rk3,
-            self.rk4,
-            self.buffer_tank,
-            self.solar,
-            *self.heat_meters,
+        # Apply instance-local firmware field declarations BEFORE calculating
+        # readable ranges and before ComponentGroup caches its pooled plan.
+        added_ranges = (
+            apply_overrides(self, firmware_reference)
+            if firmware_reference is not None
+            else {}
         )
-        register_ranges, coil_ranges = ranges_for_model(model)
-        register_ranges = ranges_excluding_addresses(
-            register_ranges,
+        default_register_ranges, default_coil_ranges = ranges_for_model(model)
+        active_names = {
+            "info",
+            "controller",
+            "clock",
+            "functions",
+            "parameters",
+            "sensors",
+            *(f"rk{index}" for index in range(1, control_circuit_count(model) + 1)),
+            "rk4",
+            "buffer_tank",
+            "solar",
+            *(f"wmz{index}" for index in self.heat_meter_indices),
+        }
+        # All members of one ComponentGroup must declare matching readable
+        # ranges; conflicting per-component declarations would be rejected by
+        # modbus-connection.model.  Expand that common map by *only* the exact
+        # spans whose explicit override proves firmware availability, then
+        # filter each component back to its standard fields + explicit changes.
+        added_spans = (
+            span
+            for name, spans in added_ranges.items()
+            if name in active_names
+            for span in spans
+        )
+        active_spans = tuple(added_spans)
+        registers = ranges_excluding_addresses(
+            _union_readable_ranges(
+                default_register_ranges,
+                (
+                    (low, high)
+                    for space, low, high in active_spans
+                    if space == "holding"
+                ),
+            ),
             self.excluded_registers,
         )
-        coil_ranges = ranges_excluding_addresses(
-            coil_ranges,
+        coils = ranges_excluding_addresses(
+            _union_readable_ranges(
+                default_coil_ranges,
+                ((low, high) for space, low, high in active_spans if space == "coil"),
+            ),
             self.excluded_coils,
         )
-        for component in all_components:
-            component.configure_readable_ranges(register_ranges, coil_ranges)
+        base_registers = ranges_excluding_addresses(
+            default_register_ranges, self.excluded_registers
+        )
+        base_coils = ranges_excluding_addresses(
+            default_coil_ranges, self.excluded_coils
+        )
+        for name, component in (
+            ("info", self.info),
+            ("controller", self.controller),
+            ("clock", self.clock),
+            ("functions", self.functions),
+            ("parameters", self.parameters),
+            ("sensors", self.sensors),
+            ("rk1", self.rk1),
+            ("rk2", self.rk2),
+            ("rk3", self.rk3),
+            ("rk4", self.rk4),
+            ("buffer_tank", self.buffer_tank),
+            ("solar", self.solar),
+            ("wmz1", self.wmz1),
+            ("wmz2", self.wmz2),
+            ("wmz3", self.wmz3),
+        ):
+            explicit = self.override_address_fields.get(name, frozenset())
+            base_fields = {
+                field
+                for field, descriptor in component._register_fields.items()
+                if component._register_field_is_readable(descriptor, base_registers)
+            }
+            base_fields.update(
+                field
+                for field, descriptor in component._bit_fields.items()
+                if is_span_readable(
+                    component._address(descriptor),
+                    getattr(descriptor, "count", 1),
+                    base_coils,
+                )
+            )
+            component.configure_readable_ranges(registers, coils)
+            component.configure_readable_fields(base_fields | explicit)
         # Inactive WMZ objects remain addressable as attributes but have no
         # readable fields and are not part of ComponentGroup.
         for meter in (self.wmz1, self.wmz2, self.wmz3):
@@ -198,15 +297,8 @@ class Trovis557x:
     async def async_probe(cls, unit: ModbusUnit) -> TrovisProbe:
         """Read only safe identity and sensor data for setup."""
         _configure_modbus_unit(unit)
-        model = int(
-            (
-                await unit.read_holding_registers(
-                    register_address(40001),
-                    1,
-                )
-            )[0]
-        )
-
+        identity = await async_read_identity(unit)
+        model = identity.model
         register_ranges, coil_ranges = ranges_for_model(model)
         model_definition = get_model_definition_for_reported_model(model)
         sensors = Sensors(unit)
@@ -232,6 +324,41 @@ class Trovis557x:
         return TrovisProbe(
             model=model,
             detected_sensors=detected_sensors,
+            firmware=identity.firmware,
+        )
+
+    @staticmethod
+    async def async_identify(unit: ModbusUnit) -> TrovisIdentity:
+        """Read mandatory model/firmware identity without optional field reads."""
+        _configure_modbus_unit(unit)
+        return await async_read_identity(unit)
+
+    @classmethod
+    async def async_create(
+        cls,
+        unit: ModbusUnit,
+        *,
+        model: int | None = None,
+        detected_sensors: Iterable[str] = (),
+        excluded_registers: Iterable[int] = (),
+        excluded_coils: Iterable[int] = (),
+        heat_meter_indices: Iterable[int] | None = None,
+    ) -> Trovis557x:
+        """Identify firmware before building the model-specific read layout."""
+        identity = await cls.async_identify(unit)
+        if model is not None and model != identity.model:
+            raise ValueError(
+                f"Configured TROVIS {model}, but device reported {identity.model}; "
+                "reconfigure the integration before reading"
+            )
+        return cls(
+            unit,
+            model=identity.model,
+            firmware_reference=identity.firmware,
+            detected_sensors=detected_sensors,
+            excluded_registers=excluded_registers,
+            excluded_coils=excluded_coils,
+            heat_meter_indices=heat_meter_indices,
         )
 
     @property

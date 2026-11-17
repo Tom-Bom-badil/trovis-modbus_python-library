@@ -173,9 +173,7 @@ def test_invalid_heat_meter_hint(unit: MockModbusUnit, hint: list[object]) -> No
 
 
 @pytest.mark.parametrize("model", [5573, 55731, 5575, 5576, 55781, 5579])
-def test_unsupported_model_rejects_heat_meter(
-    unit: MockModbusUnit, model: int
-) -> None:
+def test_unsupported_model_rejects_heat_meter(unit: MockModbusUnit, model: int) -> None:
     with pytest.raises(ValueError, match="not supported"):
         Trovis557x(unit, model=model, heat_meter_indices=(1,))
 

@@ -4,7 +4,7 @@ import pytest
 from modbus_connection.mock import MockModbusUnit
 
 from trovis_modbus import Trovis557x
-from trovis_modbus.read_exclusions import (
+from trovis_modbus.addresses import (
     normalize_excluded_addresses,
     ranges_excluding_addresses,
 )

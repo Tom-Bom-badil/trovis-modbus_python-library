@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import replace
 from enum import IntEnum
 from time import monotonic
 from typing import Any
@@ -20,6 +22,7 @@ from modbus_connection.model import (
     integer as _modbus_integer,
     raw_register as _modbus_raw_register,
 )
+from modbus_connection.model.fields import CoilField
 
 from .addresses import coil_address, register_address
 from .configurations.address_ranges import (
@@ -284,6 +287,9 @@ def _number_validator(
         # validation until we see invalid writes slipping through.
         return value
 
+    # Allow firmware overrides to replace generic numeric bounds without
+    # retaining the previous firmware's validator as an unintended restriction.
+    validate._trovis_numeric_limits = True  # type: ignore[attr-defined]
     return validate
 
 
@@ -971,6 +977,11 @@ class TrovisComponent(Component):
         then write the requested value. Operating modes intentionally bypass
         this mechanism and use :meth:`async_set_operating_mode` instead.
         """
+        if not self.is_field_readable(field):
+            raise AttributeError(f"TROVIS field {field!r} is not available")
+        descriptor = self._register_fields.get(field) or self._bit_fields.get(field)
+        if descriptor is None or not getattr(descriptor, "writable", False):
+            raise AttributeError(f"TROVIS field {field!r} is read-only")
         if (override := self.ebene_coils.get(field)) is not None:
             address, stride = override
             coil = coil_address(address + stride * (self._index - 1))
@@ -1797,3 +1808,360 @@ class TrovisComponent(Component):
 
         await self._write_datapoint_verified(field, value)
         return True
+
+
+# --- Per-device firmware/model descriptor overrides -----------------------
+
+FieldDescriptor = RegisterField[Any] | CoilField
+OverrideValue = None | Mapping[str, Any] | FieldDescriptor
+OverrideMap = Mapping[str, OverrideValue]
+
+_COMPONENTS = frozenset(
+    {
+        "info",
+        "controller",
+        "clock",
+        "functions",
+        "parameters",
+        "sensors",
+        "rk1",
+        "rk2",
+        "rk3",
+        "rk4",
+        "buffer_tank",
+        "solar",
+        "wmz1",
+        "wmz2",
+        "wmz3",
+    }
+)
+_NUMBER_PROPERTIES = frozenset(
+    {"min_value", "max_value", "step", "digits", "unit", "raw_min", "raw_max"}
+)
+_METADATA_PROPERTIES = frozenset(
+    {"maker_reference", "maker_key", "maker_category", "description"}
+)
+_DESCRIPTOR_PROPERTIES = frozenset(
+    {
+        "address",
+        "stride",
+        "count",
+        "scale_register",
+        "scale_register_stride",
+        "writable",
+    }
+)
+
+
+def _normalise_rules(rules: OverrideMap) -> dict[str, dict[str, OverrideValue]]:
+    """Expand circuit wildcards and reject conflicting/unknown selectors."""
+    changes: dict[str, dict[str, OverrideValue]] = {}
+    for selector, override in rules.items():
+        if not isinstance(selector, str) or selector.count(".") != 1:
+            raise ValueError(f"Invalid TROVIS override selector {selector!r}")
+        part, field = selector.split(".")
+        if not field.isidentifier() or field.startswith("_"):
+            raise ValueError(f"Invalid TROVIS override field {field!r}")
+        names = ("rk1", "rk2", "rk3") if part == "rk*" else (part,)
+        for name in names:
+            if name not in _COMPONENTS:
+                raise ValueError(f"Unknown TROVIS override component {name!r}")
+            component_rules = changes.setdefault(name, {})
+            if field in component_rules:
+                raise ValueError(f"Conflicting TROVIS override for {name}.{field}")
+            component_rules[field] = override
+    return changes
+
+
+def _copy_partial(
+    field: FieldDescriptor, updates: Mapping[str, Any]
+) -> FieldDescriptor:
+    """Clone a field, including its metadata and effective write validator."""
+    descriptor = copy.copy(field)
+    original_meta = getattr(field, "trovis_metadata", None)
+    number_changes = {k: v for k, v in updates.items() if k in _NUMBER_PROPERTIES}
+    meta_changes = {k: v for k, v in updates.items() if k in _METADATA_PROPERTIES}
+    unknown = (
+        set(updates)
+        - _NUMBER_PROPERTIES
+        - _METADATA_PROPERTIES
+        - _DESCRIPTOR_PROPERTIES
+    )
+    if unknown:
+        raise ValueError(
+            f"Unsupported TROVIS partial override properties: {sorted(unknown)}"
+        )
+    if number_changes:
+        if original_meta is None or original_meta.number is None:
+            raise ValueError("Numeric overrides require numeric TROVIS metadata")
+        number = replace(original_meta.number, **number_changes)
+        if (
+            number.min_value is not None
+            and number.max_value is not None
+            and number.min_value > number.max_value
+        ):
+            raise ValueError("Overridden minimum exceeds maximum")
+        meta_changes["number"] = number
+        if "unit" in number_changes:
+            descriptor.unit = number.unit
+        if descriptor.writable:
+            original_validator = descriptor.writable
+            bounds_validator = _number_validator(
+                min_value=number.min_value, max_value=number.max_value, step=number.step
+            )
+            if callable(original_validator) and not getattr(
+                original_validator, "_trovis_numeric_limits", False
+            ):
+
+                def validated(value: Any) -> Any:
+                    return original_validator(bounds_validator(value))
+
+                descriptor.writable = validated
+            else:
+                descriptor.writable = bounds_validator
+    if "address" in updates and "maker_reference" not in meta_changes:
+        # Keep manufacturer metadata consistent with a changed PDU address.
+        # All genuine factory references are HR40001+address / CL1+address.
+        meta_changes["maker_reference"] = int(updates["address"]) + (
+            40001 if isinstance(field, RegisterField) else 1
+        )
+    if meta_changes:
+        if original_meta is None:
+            raise ValueError("Partial metadata overrides require existing metadata")
+        descriptor.trovis_metadata = replace(original_meta, **meta_changes)
+    for name, value in updates.items():
+        if name not in _DESCRIPTOR_PROPERTIES:
+            continue
+        if not hasattr(descriptor, name):
+            raise ValueError(f"Field descriptor does not have {name!r}")
+        if name == "writable":
+            if not isinstance(value, bool):
+                raise ValueError("Partial writable override must be true or false")
+            if value and not bool(field.writable):
+                raise ValueError(
+                    "Overrides cannot enable write access to a read-only field"
+                )
+            if value:
+                # Existing validator (including updated numeric bounds) MUST
+                # survive.  Setting writable=True is not a way to bypass it.
+                continue
+        setattr(descriptor, name, value)
+    # A field made read-only must also lose metadata claiming write access.
+    if "writable" in updates and original_meta is not None:
+        descriptor.trovis_metadata = replace(
+            getattr(descriptor, "trovis_metadata", original_meta),
+            writable=bool(descriptor.writable),
+        )
+    return descriptor
+
+
+def _validate_descriptor(descriptor: FieldDescriptor, *, index: int) -> None:
+    """Validate full resolved Modbus spans, including scales and strides."""
+    for attribute in ("address", "stride", "count"):
+        if hasattr(descriptor, attribute):
+            value = getattr(descriptor, attribute)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"Override {attribute} must be an integer")
+    if descriptor.address < 0 or descriptor.stride < 0:
+        raise ValueError("Override addresses and strides cannot be negative")
+    count = getattr(descriptor, "count", 1)
+    if (
+        count < 1
+        or descriptor.address + descriptor.stride * (index - 1) + count > 65536
+    ):
+        raise ValueError("Overridden field exceeds the Modbus address space")
+    scale = getattr(descriptor, "scale_register", None)
+    if scale is not None:
+        stride = getattr(descriptor, "scale_register_stride", 0)
+        if (
+            not isinstance(scale, int)
+            or not isinstance(stride, int)
+            or isinstance(scale, bool)
+        ):
+            raise ValueError("Scale addresses must be integers")
+        if not 0 <= scale + stride * (index - 1) <= 65535:
+            raise ValueError(
+                "Overridden scale register is outside Modbus address space"
+            )
+
+
+def _instance_metadata(self: TrovisComponent, field: str):
+    """Return metadata for this instance's *effective and readable* fields."""
+    if not self.is_field_readable(field):
+        return None
+    descriptor = type(self).declared_fields.get(field)
+    return getattr(descriptor, "trovis_metadata", None)
+
+
+def apply_overrides(
+    device: Any, firmware: int
+) -> dict[str, tuple[tuple[str, int, int], ...]]:
+    """Apply rules before read-plan creation, returning additional approved spans.
+
+    Per-component spans are ``(space, low, high)`` in zero-based coordinates.
+    They allow an explicit added/replaced field beyond the ordinary model
+    ranges, without making unrelated fields on other components readable.
+    """
+    if isinstance(firmware, bool) or not isinstance(firmware, int) or firmware <= 0:
+        raise ValueError(
+            "Firmware identity must be a positive integer hundredths value"
+        )
+    from .configurations import overrides as override_definitions
+
+    rules = _normalise_rules(override_definitions.get_overrides(device.model, firmware))
+    extra: dict[str, tuple[tuple[str, int, int], ...]] = {}
+    added: dict[str, frozenset[str]] = {}
+    address_fields: dict[str, frozenset[str]] = {}
+    for name, overrides in rules.items():
+        component = getattr(device, name)
+        base_type = type(component)
+        original = base_type.declared_fields
+        descriptors: dict[str, FieldDescriptor] = {}
+        removed: set[str] = set()
+        new: set[str] = set()
+        expanded: list[tuple[str, int, int]] = []
+        explicitly_relocated: set[str] = set()
+        for field_name, override in overrides.items():
+            previous = original.get(field_name)
+            if override is None:
+                if previous is None:
+                    raise ValueError(f"Cannot remove unknown field {name}.{field_name}")
+                removed.add(field_name)
+                continue
+            if isinstance(override, Mapping):
+                if previous is None:
+                    raise ValueError(
+                        f"Cannot partially override unknown field {name}.{field_name}"
+                    )
+                descriptor = _copy_partial(previous, override)
+                extended = bool(
+                    {
+                        "address",
+                        "stride",
+                        "count",
+                        "scale_register",
+                        "scale_register_stride",
+                    }
+                    & override.keys()
+                )
+            elif isinstance(override, (RegisterField, CoilField)):
+                descriptor = copy.copy(override)
+                extended = True
+                if previous is None:
+                    if hasattr(base_type, field_name):
+                        raise ValueError(
+                            f"New field {name}.{field_name} would hide a class property"
+                        )
+                    new.add(field_name)
+                elif isinstance(previous, RegisterField) != isinstance(
+                    descriptor, RegisterField
+                ):
+                    raise ValueError(
+                        "Changing a field's Modbus space requires a new name: "
+                        f"{name}.{field_name}"
+                    )
+            else:
+                raise ValueError(f"Unsupported override for {name}.{field_name}")
+            if (
+                previous is not None
+                and bool(descriptor.writable)
+                and not bool(previous.writable)
+            ):
+                raise ValueError(
+                    f"Override cannot enable write access: {name}.{field_name}"
+                )
+            if previous is None and bool(descriptor.writable):
+                raise ValueError(
+                    f"New fields default to read-only: {name}.{field_name}"
+                )
+            if getattr(descriptor, "trovis_metadata", None) is None:
+                raise ValueError(
+                    f"TROVIS override lacks factory metadata: {name}.{field_name}"
+                )
+            _validate_descriptor(descriptor, index=component._index)
+            meta = descriptor.trovis_metadata
+            if meta.writable != bool(descriptor.writable):
+                raise ValueError(
+                    f"Write metadata and descriptor disagree for {name}.{field_name}"
+                )
+            if extended:
+                # A newly introduced or relocated field may not silently
+                # overlap an existing *different* field of the same address
+                # space.  Pre-existing intentional aliases are left alone.
+                start = descriptor.address + descriptor.stride * (component._index - 1)
+                stop = start + getattr(descriptor, "count", 1) - 1
+                same_location = (
+                    previous is not None
+                    and isinstance(previous, RegisterField)
+                    == isinstance(descriptor, RegisterField)
+                    and (
+                        previous.address + previous.stride * (component._index - 1)
+                        == start
+                    )
+                    and getattr(previous, "count", 1) == getattr(descriptor, "count", 1)
+                )
+                if not same_location:
+                    for existing_name, existing in original.items():
+                        if existing_name == field_name or (
+                            existing_name in overrides
+                            and overrides[existing_name] is None
+                        ):
+                            continue
+                        if isinstance(existing, RegisterField) != isinstance(
+                            descriptor, RegisterField
+                        ):
+                            continue
+                        other_start = existing.address + existing.stride * (
+                            component._index - 1
+                        )
+                        other_stop = other_start + getattr(existing, "count", 1) - 1
+                        if start <= other_stop and other_start <= stop:
+                            raise ValueError(
+                                f"Overridden field {name}.{field_name} overlaps "
+                                f"{name}.{existing_name} at PDU "
+                                f"{max(start, other_start)}"
+                            )
+            descriptors[field_name] = descriptor
+            if extended:
+                explicitly_relocated.add(field_name)
+                address = descriptor.address + descriptor.stride * (
+                    component._index - 1
+                )
+                space = (
+                    "holding"
+                    if isinstance(descriptor, RegisterField)
+                    else descriptor.space
+                )
+                expanded.append(
+                    (space, address, address + getattr(descriptor, "count", 1) - 1)
+                )
+                scale = getattr(descriptor, "scale_register", None)
+                if scale is not None:
+                    scale += descriptor.scale_register_stride * (component._index - 1)
+                    expanded.append(("holding", scale, scale))
+        if not overrides:
+            continue
+        # Component.__init_subclass__ prepares *new* descriptor maps.  Each
+        # device gets its own subclass, so other devices retain their originals.
+        effective_type = type(
+            f"{base_type.__name__}Firmware{firmware}Instance{id(component)}",
+            (base_type,),
+            {**descriptors, "metadata_for": _instance_metadata},
+        )
+        component.__class__ = effective_type
+        component._register_fields = {
+            key: value
+            for key, value in effective_type._register_fields.items()
+            if key not in removed
+        }
+        component._bit_fields = {
+            key: value
+            for key, value in effective_type._bit_fields.items()
+            if key not in removed
+        }
+        added[name] = frozenset(new)
+        address_fields[name] = frozenset(explicitly_relocated)
+        extra[name] = tuple(expanded)
+    device.added_override_fields = added
+    device.override_address_fields = address_fields
+    return extra
