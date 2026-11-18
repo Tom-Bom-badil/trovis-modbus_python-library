@@ -56,6 +56,7 @@ from .metadata import (
     OptionMetadata,
     TemporalMetadata,
 )
+from .sniffer import AddressScanResult, ScanProgress, async_scan_datapoints
 from .subsystems import (
     BufferTankCircuit,
     Clock,
@@ -75,6 +76,9 @@ from .utils import (
 )
 
 __all__ = [
+    "AddressScanResult",
+    "ScanProgress",
+    "async_scan_datapoints",
     "coil_address",
     "register_address",
     "OUTDOOR_TEMPERATURES",

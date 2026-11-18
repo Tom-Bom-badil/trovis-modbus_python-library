@@ -1,4 +1,4 @@
-"""Address helpers for TROVIS manufacturer references.
+"""Address helpers for TROVIS controller references.
 
 Modbus register addresses are commonly written in two different ways:
 -   Protocol addresses start at 0. This is the format expected by most
@@ -8,17 +8,21 @@ Modbus register addresses are commonly written in two different ways:
     in a Modbus request.
 -   Both address 0 as well as reference 40001 are pointing to the same register.
 
-The TROVIS manufacturer documentation uses its own labels, for example:
--   HR40102 for a holding register
--   CL137 for a coil
+For the library and sniffer reports, holding-register references always use
+one continuous 5-digit convention: HR = 40001 + zero-based PDU address.
+This supports PDU addresses 0..59998 without six-digit references:
 
-This module converts these manufacturer references into the zero-based
-protocol addresses expected by the Modbus library. This allows the component
-definitions to use the same references as the TROVIS documentation:
-
--   Examples:
-    HR40001 -> Modbus holding register 0, HR40002 -> register 1 ...
+    HR40001 -> Modbus holding register 0
+    HR49999 -> register 9998
+    HR50000 -> register 9999
+    HR51000 -> register 10999 (HK11-HK13)
+    HR52000 -> register 11999 (default sniffer window limit)
     CL1 -> Modbus coil 0, CL2 -> coil 1 ...
+
+Historical SAMSON documents sometimes use a six-digit 4-prefixed ordinal,
+e.g. HR411000 for PDU 10999. This is NOT the representation accepted by
+``register_address``; use HR51000 instead. The on-wire PDU addresses do not
+change. Five-digit notation cannot represent the complete 16-bit PDU space.
 """
 
 from __future__ import annotations
@@ -26,15 +30,19 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 REGISTER_REFERENCE_BASE = 40001
-REGISTER_REFERENCE_MAX = 49999
+REGISTER_REFERENCE_MAX = 99999  # Highest 5-digit reference; PDU 59998
 
 
 def register_address(hr_number: int) -> int:
-    """Return the zero-based Modbus address for a TROVIS HR reference."""
-    if hr_number < REGISTER_REFERENCE_BASE or hr_number > REGISTER_REFERENCE_MAX:
-        raise ValueError(
-            f"Expected TROVIS holding-register reference like 40102, got {hr_number}"
-        )
+    """Convert a 5-digit HR reference to a zero-based Modbus address.
+
+    The library uses HR = 40001 + PDU, including HR50000..HR99999.
+    Six-digit SAMSON ordinals are deliberately not accepted here.
+    """
+    if isinstance(hr_number, bool) or not isinstance(hr_number, int):
+        raise ValueError(f"Invalid TROVIS holding-register reference: {hr_number}")
+    if not REGISTER_REFERENCE_BASE <= hr_number <= REGISTER_REFERENCE_MAX:
+        raise ValueError(f"Invalid TROVIS holding-register reference: {hr_number}")
     return hr_number - REGISTER_REFERENCE_BASE
 
 

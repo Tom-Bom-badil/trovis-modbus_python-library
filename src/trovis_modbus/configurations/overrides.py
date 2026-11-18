@@ -47,7 +47,6 @@ def get_overrides(model: int, firmware: int) -> Mapping[str, Any]:
     """
     overrides: dict[str, Any] = {}
 
-
     # === start override definition ====================================
 
     # 2.51+: Outdoor temperature adaptation delay (CO5-F05/F06, HR40118)
