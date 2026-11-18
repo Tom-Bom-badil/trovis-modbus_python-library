@@ -1,4 +1,4 @@
-"""Read-only TROVIS FC03/FC01 address discovery, independent of model read maps.
+"""TROVIS FC03/FC01 address discovery, independent of model read maps.
 
 A successful block read proves readability of every address inside that block.
 A genuine 0x02 response triggers bisection; only a rejected single-address
@@ -20,6 +20,8 @@ from time import monotonic
 from typing import Literal, Protocol
 
 from modbus_connection import ModbusError, ModbusExceptionError
+
+from .configurations.address_ranges import control_circuit_count
 
 ScanSpace = Literal["registers", "coils"]
 AddressRange = tuple[int, int]
@@ -65,6 +67,7 @@ class AddressScanResult:
     elapsed_seconds: float
     timestamp_utc: str
     library_version: str
+    mode_settings: tuple[str, ...] = ("?", "?", "?", "?")
 
     @property
     def status(self) -> Literal["Completed", "Incomplete"]:
@@ -91,6 +94,10 @@ class AddressScanResult:
                 f"# TROVIS {self.model} | FW {self.firmware} | "
                 f"HW {self.hardware or 'unknown'} | "
                 f"System {self.system_code or 'unknown'} | {self.status}"
+            ),
+            "# Settings: "
+            + ", ".join(
+                f"Rk{i}={value}" for i, value in enumerate(self.mode_settings, start=1)
             ),
             (
                 f"# UTC {self.timestamp_utc} | "
@@ -196,6 +203,7 @@ async def async_scan_datapoints(
 
     started = monotonic()
     requests = 0
+    modes: dict[int, int] = {}
 
     async def scan_one_space(
         space: ScanSpace, total: int
@@ -247,6 +255,10 @@ async def async_scan_datapoints(
                     pending.append((address, lower))
                     continue
                 if outcome == "readable":
+                    if space == "registers":
+                        # HR40070..HR40073: physical mode selection per circuit.
+                        for pdu in range(max(address, 69), min(address + n, 73)):
+                            modes[pdu] = int(values[pdu - address])
                     found.append((address, address + n - 1))
                 elif outcome == "unknown":
                     unknown.append((address, address + n - 1))
@@ -278,4 +290,10 @@ async def async_scan_datapoints(
         elapsed_seconds=monotonic() - started,
         timestamp_utc=datetime.now(UTC).isoformat(timespec="seconds"),
         library_version=installed_version,
+        mode_settings=tuple(
+            "n/a"
+            if i == 2 and control_circuit_count(model) == 2
+            else str(modes.get(69 + i, "?"))
+            for i in range(4)
+        ),
     )

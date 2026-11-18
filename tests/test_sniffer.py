@@ -73,7 +73,7 @@ async def test_classify_every_address_and_print_five_digit_hr_references() -> No
     assert "(2, 4)" in result.report
     assert "(4, 4)" not in result.report
     assert result.report.startswith("# TROVIS 5578 | FW 2.63 | HW 1.00")
-    assert result.report.count("\n") == 6
+    assert result.report.count("\n") == 7
     assert progress[-1].space == "coils" and progress[-1].analyzed == 7
     assert all("write" not in event[0] for event in unit.calls)
 
