@@ -86,9 +86,15 @@ def test_invalid_index(unit: MockModbusUnit, index: object) -> None:
         HeatMeter(unit, index=index)
 
 
-async def test_device_polls_configured_meter_slots(unit: MockModbusUnit) -> None:
-    device = Trovis557x(unit, model=5578, heat_meter_indices=(1, 2, 3))
-    assert device.heat_meter_indices == (1, 2, 3)
+@pytest.mark.parametrize(
+    ("model", "heat_meter_indices"),
+    [(5578, (1, 2, 3)), (55781, (1, 2, 3))],
+)
+async def test_device_polls_configured_meter_slots(
+    unit: MockModbusUnit, model: int, heat_meter_indices: tuple[int, ...]
+) -> None:
+    device = Trovis557x(unit, model=model, heat_meter_indices=heat_meter_indices)
+    assert device.heat_meter_indices == heat_meter_indices
     assert device.heat_meters == (device.wmz1, device.wmz2, device.wmz3)
     for index, meter in enumerate(device.heat_meters, start=1):
         assert meter in device.components
@@ -147,8 +153,8 @@ async def test_models_without_configured_meters_skip_polling(
     [
         (5578, [], ()),
         (5578, [2], (2,)),
-        (5578, [3, 1, 1], (1, 3)),
-        (5578, (1, 2, 3), (1, 2, 3)),
+        (55781, [3, 1, 1], (1, 3)),
+        (55781, (1, 2, 3), (1, 2, 3)),
     ],
 )
 async def test_heat_meter_hint_overrides_model(
@@ -172,7 +178,7 @@ def test_invalid_heat_meter_hint(unit: MockModbusUnit, hint: list[object]) -> No
         Trovis557x(unit, heat_meter_indices=hint)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("model", [5573, 55731, 5575, 5576, 55781, 5579])
+@pytest.mark.parametrize("model", [5573, 55731, 5575, 5576, 5579])
 def test_unsupported_model_rejects_heat_meter(unit: MockModbusUnit, model: int) -> None:
     with pytest.raises(ValueError, match="not supported"):
         Trovis557x(unit, model=model, heat_meter_indices=(1,))

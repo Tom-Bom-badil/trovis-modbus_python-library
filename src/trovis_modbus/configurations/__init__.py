@@ -23,6 +23,7 @@ from .hydronic_systems import (
 from .trovis_models import (
     COMMON_INDIVIDUAL_SENSOR_VARIANTS,
     COMMON_SENSOR_KEYS,
+    MODEL_CORRECTIONS,
     MODEL_DEFINITIONS,
     THREE_CIRCUIT_SENSOR_KEYS,
     TROVIS_5573,
@@ -34,11 +35,13 @@ from .trovis_models import (
     TROVIS_5578_E,
     TROVIS_5579,
     ControllerModel,
+    ModelCorrection,
     ModelDefinition,
     SensorVariant,
     get_model_definition,
     get_model_definition_for_reported_model,
     model_candidates_for_reported_model,
+    resolve_reported_model,
     sensor_variant,
 )
 
@@ -53,6 +56,7 @@ __all__ = [
     "HYDRONIC_CONFIGURATIONS",
     "INTERMEDIATE_HEATING_SYSTEM_CODES_BY_MODEL",
     "MODEL_DEFINITIONS",
+    "MODEL_CORRECTIONS",
     "SUPPORTED_MODELS_BY_SYSTEM_CODE",
     "SUPPORTED_SYSTEM_CODES_BY_MODEL",
     "TWO_POINT_CONTROL_PARAMETER_SYSTEM_CODES_BY_MODEL",
@@ -71,11 +75,13 @@ __all__ = [
     "ControllerModel",
     "HeatMeterConfiguration",
     "ModelDefinition",
+    "ModelCorrection",
     "SensorVariant",
     "get_configuration_definition",
     "get_heat_meter_configuration",
     "get_model_definition",
     "get_model_definition_for_reported_model",
     "model_candidates_for_reported_model",
+    "resolve_reported_model",
     "sensor_variant",
 ]

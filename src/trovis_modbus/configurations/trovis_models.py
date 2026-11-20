@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import chain
 from types import MappingProxyType
 
 from ..enums import ControllerModel
@@ -328,10 +330,62 @@ def get_model_definition_for_reported_model(
     return candidates[0]
 
 
+@dataclass(frozen=True, slots=True)
+class ModelCorrection:
+    """Map a reported model and inclusive firmware interval to a supported model."""
+
+    reported_model: int
+    minimum_firmware: int
+    model: int
+    maximum_firmware: int | None = None
+
+    def __post_init__(self) -> None:
+        values = (
+            ("reported_model", self.reported_model),
+            ("minimum_firmware", self.minimum_firmware),
+            ("model", self.model),
+        )
+        if self.maximum_firmware is not None:
+            values += (("maximum_firmware", self.maximum_firmware),)
+        for name, value in values:
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            self.maximum_firmware is not None
+            and self.maximum_firmware < self.minimum_firmware
+        ):
+            raise ValueError("maximum_firmware must not be below minimum_firmware")
+        if self.model not in _REPORTED_MODEL_CANDIDATES:
+            raise ValueError(f"unsupported correction target model: {self.model}")
+
+
+MODEL_CORRECTIONS = (
+    ModelCorrection(reported_model=5578, minimum_firmware=266, model=55781),
+)
+
+
+def resolve_reported_model(
+    reported_model: int,
+    firmware: int,
+    *,
+    model_overrides: Iterable[ModelCorrection] = (),
+) -> int:
+    """Apply the first caller or built-in rule to the raw identity, without chaining."""
+    for rule in chain(model_overrides, MODEL_CORRECTIONS):
+        if (
+            rule.reported_model == reported_model
+            and firmware >= rule.minimum_firmware
+            and (rule.maximum_firmware is None or firmware <= rule.maximum_firmware)
+        ):
+            return rule.model
+    return reported_model
+
+
 __all__ = [
     "COMMON_INDIVIDUAL_SENSOR_VARIANTS",
     "COMMON_SENSOR_KEYS",
     "MODEL_DEFINITIONS",
+    "MODEL_CORRECTIONS",
     "THREE_CIRCUIT_SENSOR_KEYS",
     "TROVIS_5573",
     "TROVIS_5573_1",
@@ -343,9 +397,11 @@ __all__ = [
     "TROVIS_5579",
     "ControllerModel",
     "ModelDefinition",
+    "ModelCorrection",
     "SensorVariant",
     "get_model_definition",
     "get_model_definition_for_reported_model",
     "model_candidates_for_reported_model",
+    "resolve_reported_model",
     "sensor_variant",
 ]
