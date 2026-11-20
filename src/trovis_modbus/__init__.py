@@ -22,6 +22,7 @@ from .configurations.sensor_variants import (
     resolve_sensor_variants,
 )
 from .configurations.settings import Functions, Parameters
+from .configurations.trovis_models import ModelCorrection
 from .data_model import DEFAULT_WRITE_ACCESS_CODE
 from .device_info import DeviceInformation
 from .enums import (
@@ -97,6 +98,7 @@ __all__ = [
     "HeatMeterReadMode",
     "DomesticHotWater",
     "MonthDay",
+    "ModelCorrection",
     "TemperatureRange",
     "OperatingMode",
     "Parameters",

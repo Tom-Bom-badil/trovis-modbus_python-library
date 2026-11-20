@@ -13,11 +13,13 @@ from trovis_modbus.configurations import (
     TROVIS_5578_E,
     TROVIS_5579,
     ControllerModel as ModelsControllerModel,
+    ModelCorrection,
     ModelDefinition,
     SensorVariant,
     get_model_definition,
     get_model_definition_for_reported_model,
     model_candidates_for_reported_model,
+    resolve_reported_model,
     sensor_variant,
 )
 from trovis_modbus.configurations.trovis_models import (
@@ -91,6 +93,78 @@ def test_unique_reported_model_definition_lookup() -> None:
 
     with pytest.raises(KeyError, match="unsupported reported TROVIS model"):
         get_model_definition_for_reported_model(9999)
+
+
+@pytest.mark.parametrize(
+    ("firmware", "expected_model"),
+    ((265, 5578), (266, 5578), (300, 5578), (301, 55781)),
+)
+def test_model_override_inclusive_bounds_and_builtin_fallback(
+    firmware: int, expected_model: int
+) -> None:
+    overrides = (
+        ModelCorrection(
+            reported_model=5578,
+            minimum_firmware=266,
+            maximum_firmware=300,
+            model=5578,
+        ),
+    )
+    assert (
+        resolve_reported_model(5578, firmware, model_overrides=iter(overrides))
+        == expected_model
+    )
+
+
+def test_model_overrides_use_first_match_without_chaining() -> None:
+    first = ModelCorrection(reported_model=5578, minimum_firmware=266, model=5576)
+    second = ModelCorrection(reported_model=5578, minimum_firmware=266, model=5579)
+    chained = ModelCorrection(reported_model=5576, minimum_firmware=266, model=5573)
+
+    assert (
+        resolve_reported_model(5578, 300, model_overrides=(first, second, chained))
+        == 5576
+    )
+    assert (
+        resolve_reported_model(5578, 300, model_overrides=(second, first, chained))
+        == 5579
+    )
+
+
+def test_model_override_can_map_unknown_reported_model() -> None:
+    rule = ModelCorrection(reported_model=9999, minimum_firmware=1, model=5573)
+    assert resolve_reported_model(9999, 100, model_overrides=(rule,)) == 5573
+    assert resolve_reported_model(9998, 100, model_overrides=(rule,)) == 9998
+
+
+@pytest.mark.parametrize(
+    ("reported_model", "minimum_firmware", "model", "maximum_firmware", "message"),
+    (
+        (0, 266, 55781, None, "reported_model"),
+        (True, 266, 55781, None, "reported_model"),
+        (5578, 0, 55781, None, "minimum_firmware"),
+        (5578, True, 55781, None, "minimum_firmware"),
+        (5578, 266, 0, None, "model"),
+        (5578, 266, 9999, None, "unsupported correction target"),
+        (5578, 266, 55781, 0, "maximum_firmware"),
+        (5578, 266, 55781, True, "maximum_firmware"),
+        (5578, 266, 55781, 265, "below minimum_firmware"),
+    ),
+)
+def test_model_correction_rejects_invalid_rules(
+    reported_model: int,
+    minimum_firmware: int,
+    model: int,
+    maximum_firmware: int | None,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        ModelCorrection(
+            reported_model=reported_model,
+            minimum_firmware=minimum_firmware,
+            model=model,
+            maximum_firmware=maximum_firmware,
+        )
 
 
 @pytest.mark.parametrize("definition", MODEL_DEFINITIONS.values())

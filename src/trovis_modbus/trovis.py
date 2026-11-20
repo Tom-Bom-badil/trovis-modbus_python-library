@@ -31,7 +31,11 @@ from .configurations.sensor_variants import (
     resolve_sensor_variants,
 )
 from .configurations.settings import Functions, Parameters
-from .configurations.trovis_models import get_model_definition_for_reported_model
+from .configurations.trovis_models import (
+    ModelCorrection,
+    get_model_definition_for_reported_model,
+    resolve_reported_model,
+)
 from .data_model import (
     DEFAULT_WRITE_ACCESS_CODE,
     apply_overrides,
@@ -294,11 +298,18 @@ class Trovis557x:
         self._group = ComponentGroup(unit, self.components)
 
     @classmethod
-    async def async_probe(cls, unit: ModbusUnit) -> TrovisProbe:
-        """Read only safe identity and sensor data for setup."""
+    async def async_probe(
+        cls,
+        unit: ModbusUnit,
+        *,
+        model_overrides: Iterable[ModelCorrection] = (),
+    ) -> TrovisProbe:
+        """Read safe setup data, resolving the model before sensor discovery."""
         _configure_modbus_unit(unit)
         identity = await async_read_identity(unit)
-        model = identity.model
+        model = resolve_reported_model(
+            identity.model, identity.firmware, model_overrides=model_overrides
+        )
         register_ranges, coil_ranges = ranges_for_model(model)
         model_definition = get_model_definition_for_reported_model(model)
         sensors = Sensors(unit)
@@ -339,6 +350,7 @@ class Trovis557x:
         unit: ModbusUnit,
         *,
         model: int | None = None,
+        model_overrides: Iterable[ModelCorrection] = (),
         detected_sensors: Iterable[str] = (),
         excluded_registers: Iterable[int] = (),
         excluded_coils: Iterable[int] = (),
@@ -346,14 +358,18 @@ class Trovis557x:
     ) -> Trovis557x:
         """Identify firmware before building the model-specific read layout."""
         identity = await cls.async_identify(unit)
-        if model is not None and model != identity.model:
+        resolved_model = resolve_reported_model(
+            identity.model, identity.firmware, model_overrides=model_overrides
+        )
+        if model is not None and model != resolved_model:
             raise ValueError(
-                f"Configured TROVIS {model}, but device reported {identity.model}; "
+                f"Configured TROVIS {model}, but device reported {identity.model} "
+                f"(resolved to {resolved_model}); "
                 "reconfigure the integration before reading"
             )
         return cls(
             unit,
-            model=identity.model,
+            model=resolved_model,
             firmware_reference=identity.firmware,
             detected_sensors=detected_sensors,
             excluded_registers=excluded_registers,

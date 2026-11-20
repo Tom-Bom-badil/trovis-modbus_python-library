@@ -6,7 +6,8 @@ import pytest
 from modbus_connection import IllegalDataAddressError, ModbusTimeoutError, ReadBlock
 from modbus_connection.mock import MockModbusUnit
 
-from trovis_modbus import Trovis557x
+from trovis_modbus import ModelCorrection, Trovis557x
+from trovis_modbus.configurations import get_model_definition_for_reported_model
 from trovis_modbus.utils import (
     MAX_DIAGNOSTIC_BLOCK_SIZE,
     async_confirm_illegal_addresses,
@@ -15,6 +16,101 @@ from trovis_modbus.utils import (
 )
 
 from .conftest import HOLDING
+
+
+@pytest.mark.parametrize(
+    ("reported_model", "firmware", "expected_model"),
+    (
+        (5578, 265, 5578),
+        (5578, 266, 55781),
+        (5578, 305, 55781),
+        (55781, 266, 55781),
+        (5579, 305, 5579),
+    ),
+)
+async def test_probe_resolves_model_before_sensor_discovery(
+    mock_modbus_unit: MockModbusUnit,
+    reported_model: int,
+    firmware: int,
+    expected_model: int,
+) -> None:
+    mock_modbus_unit.holding.update(HOLDING)
+    mock_modbus_unit.holding.update({0: reported_model, 2: firmware})
+
+    probe = await Trovis557x.async_probe(mock_modbus_unit)
+
+    assert probe.model == expected_model
+    assert probe.firmware == firmware
+    assert ("ae1" in probe.detected_sensors) == (expected_model == 55781)
+
+
+@pytest.mark.parametrize(
+    ("firmware", "expected_model"), ((265, 5578), (266, 55781), (305, 55781))
+)
+async def test_factory_uses_resolved_model(
+    mock_modbus_unit: MockModbusUnit, firmware: int, expected_model: int
+) -> None:
+    mock_modbus_unit.holding.update(HOLDING)
+    mock_modbus_unit.holding.update({0: 5578, 2: firmware})
+
+    device = await Trovis557x.async_create(mock_modbus_unit)
+
+    assert device.model == expected_model
+    assert device.model_definition is get_model_definition_for_reported_model(
+        expected_model
+    )
+    assert device.firmware_reference == firmware
+    assert [(e.address, e.count) for e in mock_modbus_unit.read_events] == [
+        (0, 1),
+        (2, 1),
+    ]
+
+
+@pytest.mark.parametrize(("firmware", "expected_model"), ((266, 55781), (267, 5576)))
+async def test_probe_and_factory_share_caller_overrides(
+    mock_modbus_unit: MockModbusUnit, firmware: int, expected_model: int
+) -> None:
+    mock_modbus_unit.holding.update(HOLDING)
+    mock_modbus_unit.holding.update({0: 5578, 2: firmware})
+    overrides = (
+        ModelCorrection(reported_model=5578, minimum_firmware=267, model=5576),
+    )
+
+    probe = await Trovis557x.async_probe(mock_modbus_unit, model_overrides=overrides)
+    device = await Trovis557x.async_create(
+        mock_modbus_unit, model=probe.model, model_overrides=overrides
+    )
+
+    assert probe.model == device.model == expected_model
+    assert probe.firmware == device.firmware_reference == firmware
+    assert ("ae1" in probe.detected_sensors) == (expected_model == 55781)
+    assert device.model_definition is get_model_definition_for_reported_model(
+        expected_model
+    )
+
+
+@pytest.mark.parametrize("model", (5578, 5579))
+async def test_factory_rejects_model_mismatching_corrected_identity(
+    mock_modbus_unit: MockModbusUnit, model: int
+) -> None:
+    mock_modbus_unit.holding.update(HOLDING)
+    mock_modbus_unit.holding.update({0: 5578, 2: 266})
+    with pytest.raises(ValueError, match="reported 5578 .*resolved to 55781"):
+        await Trovis557x.async_create(mock_modbus_unit, model=model)
+
+
+async def test_identity_apis_preserve_raw_model(
+    mock_modbus_unit: MockModbusUnit,
+) -> None:
+    mock_modbus_unit.holding.update(HOLDING)
+    mock_modbus_unit.holding.update({0: 5578, 2: 266})
+
+    identity = await async_read_identity(mock_modbus_unit)
+    identified = await Trovis557x.async_identify(mock_modbus_unit)
+
+    assert identity == identified
+    assert (identity.model, identity.firmware) == (5578, 266)
+    assert len(mock_modbus_unit.read_events) == 4
 
 
 async def test_safe_identity_before_first_poll(

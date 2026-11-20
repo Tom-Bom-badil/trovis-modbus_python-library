@@ -65,6 +65,10 @@ HEAT_METER_CONFIGURATIONS = MappingProxyType(
                 model=ControllerModel.TROVIS_5578,
                 heat_meter_indices=HEAT_METER_SLOTS,
             ),
+            HeatMeterConfiguration(
+                model=ControllerModel.TROVIS_5578_E,
+                heat_meter_indices=HEAT_METER_SLOTS,
+            ),
         )
     }
 )

@@ -54,6 +54,47 @@ An example script `query.py` in the code of the library shows how to build an ap
 
 <sup>Note: Not all non-SAMSON models have yet been tested. The figures are based on the currently available documentation.</sup>
 
+## Model discovery
+
+`Trovis557x.async_probe(unit)` resolves the reported model using firmware before
+discovering model-specific sensors. A controller reporting **5578** with firmware
+**266 (2.66) or higher** resolves to **55781 (TROVIS 5578-E)**.
+`Trovis557x.async_create(unit)` uses the same correction before validating an
+optional configured `model` and selecting the device layout. In contrast,
+`async_read_identity` and `Trovis557x.async_identify` return the raw identity;
+register-backed device information also remains unchanged.
+
+Applications can supply additional corrections without modifying library rules:
+
+```python
+from trovis_modbus import ModelCorrection, Trovis557x
+
+# Example site-specific exception: retain 5578 for firmware 2.66 through 2.70.
+overrides = (
+    ModelCorrection(
+        reported_model=5578,
+        minimum_firmware=266,
+        maximum_firmware=270,
+        model=5578,
+    ),
+)
+probe = await Trovis557x.async_probe(unit, model_overrides=overrides)
+device = await Trovis557x.async_create(
+    unit,
+    model=probe.model,
+    detected_sensors=probe.detected_sensors,
+    model_overrides=overrides,
+)
+```
+
+Firmware bounds are inclusive integer hundredths; omit `maximum_firmware` for
+an open-ended rule. Caller rules are checked in order before built-in rules.
+The first match wins against the original identity, without chaining corrections.
+If none matches, the reported model is retained. An empty override iterable
+retains built-in rules. Use the same reusable rules when probing and creating a
+device. Rule targets must be supported model identifiers; malformed rules raise
+`ValueError`.
+
 ## 👉 Data provided by the library
 
 Depending on the controller model and its configuration, `trovis-modbus` provides:
